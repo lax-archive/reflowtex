@@ -14,11 +14,13 @@ None of these depend on any framework; they operate on the parsed dict and (for
 fonts) a Fonts instance from fonts.py.
 """
 
+import os
 import re
 import subprocess
 import sys
 import tempfile
 import unicodedata
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from fonts import fonts_of
@@ -28,8 +30,11 @@ from fonts import fonts_of
 # Node types the schema (schema/latex.proto) can encode. Anything else (e.g.
 # 'whatsit' nodes from xcolor's colour-stack markers, 'local_par' markers) is
 # zero-width, carries no rendering meaning, and is dropped before encoding.
+# 'marker' (lax) is a supported type: a \laxmark stream anchor the viewer
+# must receive — stripping it here would silently unmoor every passage card.
 SUPPORTED_NODE_TYPES = {'glyph', 'glue', 'kern', 'rule', 'hlist', 'vlist',
-                        'disc', 'penalty', 'math', 'picture', 'transform'}
+                        'disc', 'penalty', 'math', 'picture', 'transform',
+                        'marker'}
 
 # LEADER_NOTE: leader glue (\cleaders and friends) hangs a single box off the
 # glue node, which TeX tiles across the glue's set width. It is a node like any
@@ -212,6 +217,138 @@ def normalise_legacy_font_addressing(data: dict, fonts) -> int:
 #    black), so the renderer sets the inherited fill on the wrapping <g> rather
 #    than rewriting each path.
 
+# The dvisvgm invocation is injectable (lax): REFLOWTEX_DVISVGM, read per
+# call, names the command that converts one PDF to SVG with dvisvgm's CLI
+# contract. The trusted validation path points it at a wrapper that runs the
+# conversion inside the pinned TeX container, so no host dvisvgm is assumed.
+def dvisvgm_command() -> str:
+    return os.environ.get('REFLOWTEX_DVISVGM', 'dvisvgm')
+
+
+# ── SVG sanitisation ─────────────────────────────────────────────────────────
+# (lax) The converted markup is embedded inline in served pages, and under
+# -shell-escape a document can smuggle *arbitrary* SVG through dvisvgm-raw
+# specials — so everything passes an element/attribute allowlist before it
+# enters the blob. Drawing primitives, structure, text, transforms, clips and
+# gradients survive; scripts, event handlers, style sheets, foreign objects
+# and every reference that is not a same-document fragment are dropped, with
+# the removals reported so a legitimate picture losing content is loud. The
+# site's CSP is defense in depth, not the only wall.
+
+SVG_NS   = 'http://www.w3.org/2000/svg'
+XLINK_NS = 'http://www.w3.org/1999/xlink'
+
+SVG_ALLOWED_ELEMENTS = frozenset({
+    'svg', 'g', 'defs', 'symbol', 'use', 'title', 'desc',
+    'path', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon',
+    'text', 'tspan', 'textPath',
+    'clipPath', 'mask', 'marker', 'pattern',
+    'linearGradient', 'radialGradient', 'stop',
+})
+
+SVG_ALLOWED_ATTRIBUTES = frozenset({
+    'id', 'viewBox', 'preserveAspectRatio', 'version',
+    'transform', 'gradientTransform', 'patternTransform',
+    'gradientUnits', 'patternUnits', 'patternContentUnits', 'clipPathUnits',
+    'maskUnits', 'maskContentUnits', 'markerUnits', 'spreadMethod',
+    'href', 'xlink:href',
+    'x', 'y', 'x1', 'y1', 'x2', 'y2', 'dx', 'dy', 'cx', 'cy', 'r', 'rx', 'ry',
+    'fx', 'fy', 'width', 'height', 'd', 'points', 'offset', 'rotate',
+    'markerWidth', 'markerHeight', 'refX', 'refY', 'orient',
+    'fill', 'fill-rule', 'fill-opacity', 'stroke', 'stroke-width',
+    'stroke-linecap', 'stroke-linejoin', 'stroke-miterlimit',
+    'stroke-dasharray', 'stroke-dashoffset', 'stroke-opacity',
+    'opacity', 'color', 'clip-path', 'clip-rule', 'mask',
+    'font-family', 'font-size', 'font-style', 'font-weight', 'font-stretch',
+    'text-anchor', 'dominant-baseline', 'letter-spacing', 'word-spacing',
+    'vector-effect', 'shape-rendering', 'visibility', 'display', 'overflow',
+    'stop-color', 'stop-opacity',
+})
+
+# Every url(...) inside an attribute value must be a same-document fragment
+# (fill='url(#gradient)'); anything else can reach out of the page.
+SVG_URL_REF_RE = re.compile(r"""url\(\s*(["']?)(.*?)\1\s*\)""", re.IGNORECASE | re.DOTALL)
+
+
+def _svg_attribute_name(qualified: str) -> str | None:
+    """The allowlist name of an attribute: bare names pass through, xlink:href
+    is recognised, every other namespace is rejected."""
+    if not qualified.startswith('{'):
+        return qualified
+    ns, _, local = qualified[1:].partition('}')
+    if ns == XLINK_NS and local == 'href':
+        return 'xlink:href'
+    return None
+
+
+def _svg_attribute_safe(name: str, value: str) -> bool:
+    if name not in SVG_ALLOWED_ATTRIBUTES:
+        return False
+    if name in ('href', 'xlink:href'):
+        return value.startswith('#')
+    for m in SVG_URL_REF_RE.finditer(value):
+        if not m.group(2).startswith('#'):
+            return False
+    return True
+
+
+def _svg_escape_text(value: str) -> str:
+    return value.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
+def _svg_escape_attr(value: str) -> str:
+    return _svg_escape_text(value).replace("'", '&apos;')
+
+
+def sanitize_svg(text: str) -> tuple[str, list[str]]:
+    """Filter SVG markup through the allowlist. Returns the sanitised markup
+    (single-quoted attributes, element order and text preserved) and a sorted
+    list of what was removed ('element script', 'attribute onload', …). Raises
+    on markup that does not parse — a picture must never half-survive."""
+    if re.search(r'<!\s*(?:DOCTYPE|ENTITY)', text, re.IGNORECASE):
+        raise RuntimeError('SVG contains a document type declaration — refused')
+    root = ET.fromstring(text)
+    removed: set[str] = set()
+    out: list[str] = []
+
+    def local_name(tag: str) -> str | None:
+        if not tag.startswith('{'):
+            return tag
+        ns, _, local = tag[1:].partition('}')
+        return local if ns == SVG_NS else None
+
+    def emit(el) -> None:
+        name = local_name(el.tag) if isinstance(el.tag, str) else None
+        if name is None or name not in SVG_ALLOWED_ELEMENTS:
+            # Dropped subtree; its tail is the parent's plain text and stays.
+            removed.add(f'element {name or el.tag}')
+            if el.tail:
+                out.append(_svg_escape_text(el.tail))
+            return
+        attrs: list[str] = []
+        for qualified, value in el.attrib.items():
+            attr = _svg_attribute_name(qualified)
+            if attr is None or not _svg_attribute_safe(attr, value):
+                removed.add(f'attribute {attr or qualified}')
+                continue
+            attrs.append(f" {attr}='{_svg_escape_attr(value)}'")
+        out.append(f'<{name}' + ''.join(attrs))
+        if len(el) == 0 and el.text is None:
+            out.append('/>')
+        else:
+            out.append('>')
+            if el.text:
+                out.append(_svg_escape_text(el.text))
+            for child in el:
+                emit(child)
+            out.append(f'</{name}>')
+        if el.tail:
+            out.append(_svg_escape_text(el.tail))
+
+    emit(root)
+    return ''.join(out), sorted(removed)
+
+
 SVG_ID_RE    = re.compile(r"\bid='([^']+)'")
 SVG_USE_RE   = re.compile(r"(xlink:href|href)='#([^']+)'")
 # dvisvgm shortens colours to 3-digit hex under --optimize (#f00, not #ff0000),
@@ -273,21 +410,31 @@ def convert_pictures(data: dict, build_dir: Path) -> int:
                     out = build_dir / f'{src}.svg'
                     if not pdf.exists():
                         sys.exit(f'ERROR: picture {pdf} missing — did tikz externalisation run?')
-                    # --tmpdir is required for correctness, not tidiness: dvisvgm's
-                    # temporary files are not namespaced per process, so concurrent
-                    # conversions (blocks compile on a thread pool) collide and some
-                    # silently emit an SVG with every glyph missing. It exits 0 and
-                    # writes valid SVG, so nothing downstream can tell — the picture
-                    # just loses all its labels. A private tmpdir avoids it.
-                    with tempfile.TemporaryDirectory(prefix='dvisvgm-') as tmpdir:
-                        r = subprocess.run(
-                            ['dvisvgm', '--pdf', '--no-fonts', '--optimize=all',
-                             f'--tmpdir={tmpdir}', f'--output={out}', str(pdf)],
-                            cwd=build_dir, capture_output=True, text=True)
+                    # (lax) A pre-converted `<src>.svg` beside the PDF is consumed
+                    # as-is: the trusted validation path converts every picture
+                    # inside the pinned TeX image right after the compile, so the
+                    # encode host needs no dvisvgm at all. The sanitiser below
+                    # still runs on every consumed SVG, whoever produced it.
                     if not out.exists():
-                        sys.exit(f'ERROR: dvisvgm failed on {pdf}:\n{r.stderr[-2000:]}')
+                        # --tmpdir is required for correctness, not tidiness: dvisvgm's
+                        # temporary files are not namespaced per process, so concurrent
+                        # conversions (blocks compile on a thread pool) collide and some
+                        # silently emit an SVG with every glyph missing. It exits 0 and
+                        # writes valid SVG, so nothing downstream can tell — the picture
+                        # just loses all its labels. A private tmpdir avoids it.
+                        with tempfile.TemporaryDirectory(prefix='dvisvgm-') as tmpdir:
+                            r = subprocess.run(
+                                [dvisvgm_command(), '--pdf', '--no-fonts', '--optimize=all',
+                                 f'--tmpdir={tmpdir}', f'--output={out}', str(pdf)],
+                                cwd=build_dir, capture_output=True, text=True)
+                        if not out.exists():
+                            sys.exit(f'ERROR: dvisvgm failed on {pdf}:\n{r.stderr[-2000:]}')
+                    clean, dropped = sanitize_svg(out.read_text(encoding='utf-8'))
+                    if dropped:
+                        print(f'  {build_dir.name}: svg sanitiser dropped from {src}: '
+                              + ', '.join(dropped))
                     inner, vb_w, vb_h = _rewrite_picture_svg(
-                        out.read_text(encoding='utf-8'), f'p{len(pictures)+1}-')
+                        clean, f'p{len(pictures)+1}-')
                     pictures.append({'svg': inner, 'vb_w': vb_w, 'vb_h': vb_h})
                     by_file[src] = len(pictures)      # 1-based
                     converted += 1
