@@ -103,7 +103,10 @@ class Fonts:
         local dir or the TeX installation the first time it is needed."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         for fname in sorted(filenames):
-            if not fname:
+            if not fname or fname == 'unknown':
+                # (lax) 'unknown' is the serializer's placeholder for a face
+                # with no font file — a legacy 8-bit font whose outline did
+                # not convert (legacy_otf) — never a file to look up.
                 continue
             dst = self.output_dir / fname
             if dst.exists():
@@ -112,7 +115,14 @@ class Fonts:
                 self._copy_atomic(self.local_dir / fname, dst)
                 print(f'  font-provision: {fname} ← {self.local_dir / fname}')
                 continue
-            result = subprocess.run(['kpsewhich', fname], capture_output=True, text=True)
+            try:
+                result = subprocess.run(['kpsewhich', fname], capture_output=True, text=True)
+            except OSError:
+                # (lax) No kpsewhich on this host at all: the same degraded
+                # outcome as a miss, never an uncaught crash.
+                print(f'  font-provision: WARNING — {fname} not found (no kpsewhich on this host); '
+                      f'the browser will fall back to a system font')
+                continue
             src = result.stdout.strip()
             if result.returncode != 0 or not src:
                 print(f'  font-provision: WARNING — {fname} not found via kpsewhich; '

@@ -74,6 +74,11 @@ _SEARCHABLE_SINGLES = frozenset({
     0x2013, 0x2014,                     # – —  (en/em dash)
     0x2018, 0x2019, 0x201C, 0x201D,     # ' ' " "  (curly quotes)
     0x2020, 0x2021, 0x2026, 0x2122,     # † ‡ …  ™
+    # (lax) The f-ligature presentation forms: every classic text face
+    # carries ff/fi/fl/ffi/ffl as single glyphs whose AGL names resolve
+    # here. NFKC folds them back to their letters, so browser search and a
+    # text comparison both read "fi" — a PUA code would split the word.
+    0xFB00, 0xFB01, 0xFB02, 0xFB03, 0xFB04,
 })
 
 
@@ -113,27 +118,121 @@ def _addressing(slots: dict[int, str]) -> dict[int, int]:
     return addressing
 
 
-def find_pfb(name: str) -> str | None:
-    """Locate a font's Type1 outline. With REFLOWTEX_PFB_DIR set (read per
-    call), that directory is the *only* source — the lax trusted path
-    exports the outlines from its pinned TeX image because the encode host
-    has no TeX tree, and a host tree must never silently substitute for a
-    missed export. Otherwise kpsewhich, as stock — but a host without
-    kpsewhich yields None (the caller keeps the metric-box fallback),
-    never an uncaught crash."""
-    local = os.environ.get('REFLOWTEX_PFB_DIR')
-    if local:
-        candidate = Path(local) / f'{name}.pfb'
-        return str(candidate) if candidate.is_file() else None
+def _kpsewhich(filename: str) -> str | None:
+    """kpsewhich's answer for one file, or None — not found, or no kpsewhich
+    on this host at all (the lax encode host has no TeX tree)."""
     try:
-        r = subprocess.run(['kpsewhich', f'{name}.pfb'], capture_output=True, text=True)
+        r = subprocess.run(['kpsewhich', filename], capture_output=True, text=True)
     except OSError:
         return None
     return r.stdout.strip() or None
 
 
+_MAP_CACHE: dict[str, str] | None = None
+
+
+def _map_entry(name: str) -> str | None:
+    """The pdftex.map line for a TeX font name, or None. The map is located
+    with kpsewhich and read once per process; the first line per name wins,
+    as it does for the engines."""
+    global _MAP_CACHE
+    if _MAP_CACHE is None:
+        _MAP_CACHE = {}
+        path = _kpsewhich('pdftex.map')
+        if path:
+            try:
+                with open(path, encoding='latin-1') as fh:
+                    for line in fh:
+                        if not line.strip() or line[0] in '%#':
+                            continue
+                        _MAP_CACHE.setdefault(line.split(None, 1)[0], line.rstrip('\n'))
+            except OSError:
+                pass
+    return _MAP_CACHE.get(name)
+
+
+def _map_line_files(line: str) -> tuple[str | None, str | None]:
+    """The (outline, encoding vector) file names a pdftex.map line references
+    through its `<file` tokens (`<<file` and `<[file` carry dvips inclusion
+    hints and name the same files); None for a leg the line does not have."""
+    pfb = enc = None
+    for token in line.split():
+        if not token.startswith('<'):
+            continue
+        filename = token.lstrip('<')
+        if filename.startswith('['):
+            filename = filename[1:]
+        if filename.endswith('.enc'):
+            enc = filename
+        elif filename.endswith(('.pfb', '.pfa')):
+            pfb = filename
+    return pfb, enc
+
+
+def find_outline(name: str) -> tuple[str, str | None] | None:
+    """Locate a font's Type1 outline and, when the TeX side re-encodes it,
+    the encoding vector it is used through: (pfb path, enc path or None), or
+    None when the face has no outline to convert.
+
+    (lax) With REFLOWTEX_PFB_DIR set (read per call), that directory is the
+    *only* source — `<name>.pfb`, plus `<name>.enc` beside it when the
+    exporter resolved a re-encoding. The lax trusted path exports both from
+    its pinned TeX image under the TeX name, because the encode host has no
+    TeX tree, and a host tree must never silently substitute for a missed
+    export. Otherwise the font's pdftex.map entry decides, exactly as it
+    does for pdfTeX and LuaTeX: `ec-lmr10` is `lmr10.pfb` re-encoded through
+    `lm-ec.enc`, and reading the outline's built-in encoding instead would
+    address every slot above ASCII wrongly — so a re-encoded face whose
+    vector cannot be found yields None (metric boxes, never wrong glyphs).
+    A name without a map entry falls back to `<name>.pfb` as stock. A host
+    without kpsewhich yields None (the caller keeps the metric-box
+    fallback), never an uncaught crash.
+    """
+    local = os.environ.get('REFLOWTEX_PFB_DIR')
+    if local:
+        pfb = Path(local) / f'{name}.pfb'
+        if not pfb.is_file():
+            return None
+        enc = Path(local) / f'{name}.enc'
+        return str(pfb), (str(enc) if enc.is_file() else None)
+    line = _map_entry(name)
+    if line is not None:
+        pfb_name, enc_name = _map_line_files(line)
+        pfb = _kpsewhich(pfb_name) if pfb_name else None
+        if pfb:
+            if enc_name is None:
+                return pfb, None
+            enc = _kpsewhich(enc_name)
+            return (pfb, enc) if enc else None
+    pfb = _kpsewhich(f'{name}.pfb')
+    return (pfb, None) if pfb else None
+
+
+def find_pfb(name: str) -> str | None:
+    """The outline path alone — see find_outline."""
+    found = find_outline(name)
+    return found[0] if found else None
+
+
+def parse_enc(path: str) -> list[str]:
+    """The 256 glyph names of a dvips/pdftex `.enc` vector — `/Name [ /g0 …
+    /g255 ] def`, `%` comments stripped — in slot order."""
+    body = []
+    for line in Path(path).read_text(encoding='latin-1').splitlines():
+        cut = line.find('%')
+        body.append(line if cut < 0 else line[:cut])
+    joined = '\n'.join(body)
+    start, end = joined.find('['), joined.rfind(']')
+    if start < 0 or end < start:
+        raise ValueError(f'{path}: no encoding vector')
+    names = [token[1:] for token in joined[start + 1:end].split() if token.startswith('/')]
+    if len(names) != 256:
+        raise ValueError(f'{path}: {len(names)} encoding entries, not 256')
+    return names
+
+
 def convert(name: str, out_dir: Path) -> tuple[str, dict[int, int]] | None:
-    """Convert <name>.pfb → a content-hashed OTF in out_dir.
+    """Convert <name>'s outline → a content-hashed OTF in out_dir.
 
     Returns (served_filename, {source slot -> target codepoint}) or None when the
     font cannot be converted — it has no Type1 outline (a genuinely bitmap-only
@@ -142,22 +241,25 @@ def convert(name: str, out_dir: Path) -> tuple[str, dict[int, int]] | None:
     """
     if not _AVAILABLE:
         return None
-    pfb = find_pfb(name)
-    if not pfb:
+    found = find_outline(name)
+    if not found:
         return None
+    pfb, enc = found
     try:
-        return _convert(pfb, name, Path(out_dir))
+        return _convert(pfb, name, Path(out_dir), parse_enc(enc) if enc else None)
     except Exception as e:                                  # noqa: BLE001
         print(f'  t1-convert: {name} skipped ({type(e).__name__}: {e}) — keeps metric boxes')
         return None
 
 
-def _convert(pfb: str, name: str, out_dir: Path) -> tuple[str, dict[int, int]]:
+def _convert(pfb: str, name: str, out_dir: Path,
+             encoding: list[str] | None = None) -> tuple[str, dict[int, int]]:
     # latin-1, not the default ascii: some faces (e.g. eurosym's fey*) carry a
     # non-ASCII byte in their PostScript header that the ascii decoder rejects.
     t1 = t1Lib.T1Font(pfb, encoding='latin-1')
     t1.parse()
-    encoding = t1.font['Encoding']             # 256 entries: slot -> glyph name
+    if encoding is None:
+        encoding = t1.font['Encoding']         # 256 entries: slot -> glyph name
     glyphs = t1.getGlyphSet()
     upm = round(1 / t1.font['FontMatrix'][0])  # units per em (1000 for CM/AMS)
 
