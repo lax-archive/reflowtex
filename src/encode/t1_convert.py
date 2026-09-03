@@ -41,6 +41,7 @@ fontTools is required (t1Lib for parsing, fontBuilder for emitting). Without it,
 convert() is unavailable and the caller keeps the metric-box fallback.
 """
 import hashlib
+import os
 import subprocess
 from pathlib import Path
 
@@ -113,8 +114,21 @@ def _addressing(slots: dict[int, str]) -> dict[int, int]:
 
 
 def find_pfb(name: str) -> str | None:
-    """Locate a font's Type1 outline in the TeX tree (None if it is bitmap-only)."""
-    r = subprocess.run(['kpsewhich', f'{name}.pfb'], capture_output=True, text=True)
+    """Locate a font's Type1 outline. With REFLOWTEX_PFB_DIR set (read per
+    call), that directory is the *only* source — the lax trusted path
+    exports the outlines from its pinned TeX image because the encode host
+    has no TeX tree, and a host tree must never silently substitute for a
+    missed export. Otherwise kpsewhich, as stock — but a host without
+    kpsewhich yields None (the caller keeps the metric-box fallback),
+    never an uncaught crash."""
+    local = os.environ.get('REFLOWTEX_PFB_DIR')
+    if local:
+        candidate = Path(local) / f'{name}.pfb'
+        return str(candidate) if candidate.is_file() else None
+    try:
+        r = subprocess.run(['kpsewhich', f'{name}.pfb'], capture_output=True, text=True)
+    except OSError:
+        return None
     return r.stdout.strip() or None
 
 
