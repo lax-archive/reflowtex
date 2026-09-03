@@ -129,6 +129,18 @@ local CITETGT_ATTR = 904  -- glyphs of a bibliography label [n]
 local RULE_IMAGE  = 2
 local picture_files = {}
 
+-- lax: \laxmark (laxreflow.sty, the archive's injection package) lowers each
+-- lax marker to a user_defined whatsit with this user_id and a string value
+-- "b:<n>" / "e:<n>". A marker is an exact content-stream position; ids never
+-- enter the node list (the submission's mark table maps numbers back).
+local LAX_MARK_ID = 90210
+local function lax_marker(n)
+    if n.user_id ~= LAX_MARK_ID then return nil end
+    local side, num = tostring(n.value):match("^([be]):(%d+)$")
+    if not side then return nil end
+    return side, tonumber(num)
+end
+
 Serializer = Serializer or {}
 function Serializer.note_picture(id, file)
     picture_files[id] = file
@@ -207,6 +219,12 @@ local function serialize_nodelist(head)
                     for _, item in ipairs(f.list) do cur[#cur + 1] = item end
                 end
             end
+
+        elseif t == "whatsit" and lax_marker(n) then
+            -- lax: a marker inside a paragraph (horizontal mode) is an
+            -- exact position in the captured node list.
+            local side, num = lax_marker(n)
+            cur[#cur + 1] = { type = "marker", side = side, n = num }
 
         elseif t == "whatsit" and n.stack ~= nil and n.command ~= nil then
             -- pdf_colorstack whatsit: update colour state; nothing to emit
@@ -500,13 +518,19 @@ local content   = {}
 local seen_para = {}
 
 -- amsmath leaves an empty paragraph behind after an alignment (a zero-content
--- fire that exists only to close the display group). It has no glyphs, so it
+-- fire that exists only to close the display group). It has no ink, so it
 -- would render as an empty line; skip such paragraphs entirely.
-local function has_glyphs(nodes)
+-- lax: was has_glyphs, and gating body emission on glyphs alone silently
+-- dropped every paragraph whose only ink is an externalised picture (a
+-- standalone tikzpicture between blank lines is exactly that: an hlist
+-- holding one picture rule, no glyph at any depth). Body content is
+-- anything bearing glyphs OR pictures; a capture with neither still takes
+-- the marker-hoist branch below.
+local function has_ink(nodes)
     for _, n in ipairs(nodes) do
-        if n.type == "glyph" then return true end
-        if n.children and has_glyphs(n.children) then return true end
-        if n.replace and has_glyphs(n.replace) then return true end
+        if n.type == "glyph" or n.type == "picture" then return true end
+        if n.children and has_ink(n.children) then return true end
+        if n.replace and has_ink(n.replace) then return true end
     end
     return false
 end
@@ -515,6 +539,15 @@ local function emit_vspace(sp)
     if sp and sp ~= 0 and #content > 0 then
         content[#content + 1] = { kind = "vspace", amount = sp }
     end
+end
+
+-- lax: markers must be transparent to the spacing logic below, so the
+-- "what did the stream just emit" questions skip over trailing marker items.
+local function last_flow()
+    for i = #content, 1, -1 do
+        if content[i].kind ~= "marker" then return content[i] end
+    end
+    return nil
 end
 
 -- The band of the most recent paragraph; displays inherit it.
@@ -529,8 +562,9 @@ local function walk_page(head, pending)
                 cur_band.indent = all_paragraphs[p].indent
                 cur_band.width  = all_paragraphs[p].width
             end
-            if p and not seen_para[p] and has_glyphs(all_paragraphs[p].nodes) then
+            if p and not seen_para[p] and has_ink(all_paragraphs[p].nodes) then
                 seen_para[p] = true
+                local lf = last_flow()   -- lax: look through marker items
                 if not pending.body_seen then
                     -- First body line on this page: the glue above it is page
                     -- furniture — the top margin, the running header, and \headsep —
@@ -544,10 +578,10 @@ local function walk_page(head, pending)
                     -- furniture. In the reflowed (pageless) output the display and
                     -- this paragraph are adjacent, so restore that skip — TeX's own
                     -- parameter, not a guessed constant — or they abut too tightly.
-                    if content[#content] and content[#content].kind == "display" then
-                        emit_vspace(content[#content].below_skip or 0)
+                    if lf and lf.kind == "display" then
+                        emit_vspace(lf.below_skip or 0)
                     end
-                elseif content[#content] and content[#content].kind == "display" then
+                elseif lf and lf.kind == "display" then
                     -- Abutting a display, keep TeX's full glue: above/belowdisplayskip
                     -- carries the display's spacing.
                     emit_vspace(pending.sp)
@@ -559,24 +593,43 @@ local function walk_page(head, pending)
                 end
                 content[#content + 1] = { kind = "paragraph", para = p }
             end
+            if p and not seen_para[p] and not has_ink(all_paragraphs[p].nodes) then
+                -- lax: an inkless paragraph capture is skipped, but a
+                -- marker whatsit inside it (e.g. `\end{equation}` directly
+                -- followed by the end marker and then a blank line — the resumed
+                -- paragraph holds only the whatsit) must not vanish with it:
+                -- hoist its markers into the stream at this position.
+                seen_para[p] = true
+                local function hoist(nodes)
+                    for _, it in ipairs(nodes) do
+                        if it.type == "marker" then
+                            content[#content + 1] = { kind = "marker", side = it.side, n = it.n }
+                        end
+                        if it.children then hoist(it.children) end
+                        if it.replace then hoist(it.replace) end
+                    end
+                end
+                hoist(all_paragraphs[p].nodes)
+            end
             pending.sp = 0
             pending.explicit = 0
         elseif t == "hlist" and (n.subtype == HL_EQUATION or n.subtype == HL_ALIGNMENT) then
+            local lf = last_flow()   -- lax: look through marker items
             if pending.body_seen then
                 emit_vspace(pending.sp)
-            elseif content[#content] and content[#content].kind == "paragraph" then
+            elseif lf and lf.kind == "paragraph" then
                 -- Display first on a page after a paragraph on the previous page:
                 -- its \abovedisplayskip was discarded with the furniture at the
                 -- break. Restore it (the symmetric case to belowdisplayskip above).
                 emit_vspace(param_dimen("abovedisplayskip"))
-            elseif content[#content] and content[#content].kind == "display" then
+            elseif lf and lf.kind == "display" then
                 -- Two displays split by a page break (no glyph-bearing paragraph
                 -- between them, so they are adjacent in the stream). In continuous
                 -- flow TeX separates them by \belowdisplayskip + \abovedisplayskip;
                 -- both were discarded at the break (one as the page-bottom breakpoint
                 -- glue, the other as top-of-page furniture), so without this the two
                 -- displays abut. Restore the pair so the join matches unbroken flow.
-                emit_vspace((content[#content].below_skip or 0) + param_dimen("abovedisplayskip"))
+                emit_vspace((lf.below_skip or 0) + param_dimen("abovedisplayskip"))
             end
             pending.body_seen = true
             pending.sp = 0
@@ -616,6 +669,14 @@ local function walk_page(head, pending)
             end
         elseif t == "kern" then
             pending.sp = (pending.sp or 0) + (n.kern or 0)
+        elseif t == "whatsit" and lax_marker(n) then
+            -- lax: a vertical-mode marker sits in the page's vertical
+            -- list between line boxes / displays; stock code has no branch for
+            -- whatsits here and would silently drop it. Emitted in place, and
+            -- deliberately not touching `pending`, so glue accounting around
+            -- the marker is unchanged.
+            local side, num = lax_marker(n)
+            content[#content + 1] = { kind = "marker", side = side, n = num }
         end
     end
 end
