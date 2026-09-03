@@ -12,6 +12,13 @@ Usage: python3 encode_pb.py <output.json> <nodelist.pb>
 import json, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# lax: latex_pb2.py is regenerated from the (patched) schema into the
+# checkout's build/ area at fetch time — never at run time, and never into
+# this tree (see pipeline._ensure_pb2). Prefer that copy over any stale
+# committed one, or the marker fields would silently be missing.
+_BUILD_DIR = Path(__file__).resolve().parent.parent.parent / 'build'
+if (_BUILD_DIR / 'latex_pb2.py').exists():
+    sys.path.insert(0, str(_BUILD_DIR))
 import latex_pb2 as L
 from google.protobuf.descriptor import FieldDescriptor as FD
 
@@ -21,6 +28,10 @@ from google.protobuf.descriptor import FieldDescriptor as FD
 OMIT_IF_ZERO = {'stretch_order', 'shrink_order', 'subtype', 'shift', 'glue_sign', 'glue_order'}
 # Fields the pipeline carries but the wire format does not (dropped, as stripNode did).
 NOT_ENCODED = {'file', 'gindex'}
+# lax: proto2 scopes enum value names to the package, so NodeType cannot also
+# name a value 'marker' (ItemKind claims it). The serializer's JSON keeps
+# type:"marker" for nodes; on the wire that is NodeType.mark.
+ENUM_ALIASES = {('latex.NodeType', 'marker'): 'mark'}
 
 
 def intern_glyph_metrics(doc: dict) -> None:
@@ -70,7 +81,16 @@ def fill(msg, d: dict) -> None:
         if k in OMIT_IF_ZERO and v == 0:
             continue
         if f.type == FD.TYPE_ENUM:
-            setattr(msg, k, f.enum_type.values_by_name[v].number)
+            # lax: name the schema when an enum value is unknown — a stale
+            # latex_pb2.py meeting a marker item otherwise dies as a bare
+            # KeyError: 'marker' three frames deep.
+            wire_name = ENUM_ALIASES.get((f.enum_type.full_name, v), v)
+            value = f.enum_type.values_by_name.get(wire_name)
+            if value is None:
+                raise ValueError(f'{f.enum_type.full_name} has no value {v!r} — '
+                                 f'latex_pb2.py is out of step with latex.proto '
+                                 f'(regenerate it at fetch time)')
+            setattr(msg, k, value.number)
         elif f.type == FD.TYPE_MESSAGE:
             if f.is_repeated:
                 for item in v:
@@ -99,12 +119,18 @@ def build_document(data: dict) -> L.Document:
     return out
 
 
+def serialize_document(data: dict) -> bytes:
+    """The one serialization site (lax): deterministic=True makes protobuf's
+    ordering guarantees explicit — the bundle digest must not depend on which
+    runtime serialized it — rather than measured-stable."""
+    return build_document(data).SerializeToString(deterministic=True)
+
+
 def main() -> None:
     if len(sys.argv) != 3:
         sys.exit('Usage: python3 encode_pb.py <output.json> <nodelist.pb>')
     data = json.loads(Path(sys.argv[1]).read_text())
-    out = build_document(data)
-    blob = out.SerializeToString()
+    blob = serialize_document(data)
     Path(sys.argv[2]).write_bytes(blob)
     print(f'{sys.argv[2]}  {len(blob)} bytes')
 
