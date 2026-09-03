@@ -31,6 +31,12 @@ enum NodeType {
   math      = 8;
   picture   = 9;   // an externalised tikzpicture, drawn from precompiled SVG
   transform = 10;  // \rotatebox and friends: a matrix applied to `children`
+  // lax: a \laxmark whatsit inside a paragraph — an anchor, never drawn.
+  // proto2 scopes enum value names to the *package* (C++ rules), so this
+  // cannot also be spelled `marker` (ItemKind claims that name): the wire
+  // name for marker nodes is `mark`; the serializer's JSON says
+  // type:"marker" and encode_pb maps it.
+  mark      = 11;
 }
 
 message Node {
@@ -77,6 +83,13 @@ message Node {
   // depth are interned there (the same box repeats across thousands of glyphs)
   // and referenced here instead of stored inline. Only glyphs use this.
   optional uint32   metrics       = 32;
+
+  // marker (lax): an exact position in the paragraph's node list. `side` is
+  // "b" (begin) or "e" (end); `n` is the mark number from the submission's
+  // mark table (ids never enter the wire form). Zero-size and invisible: the
+  // viewer exposes it as an anchor and the line breaker treats it as ink-free.
+  optional string   side          = 33;
+  optional uint32   n             = 34;
 }
 
 // One distinct glyph box (width/height/depth in sp), referenced by Node.metrics.
@@ -120,6 +133,7 @@ enum ItemKind {
   paragraph = 0;
   display   = 1;
   vspace    = 2;
+  marker    = 3;  // lax: a \laxmark whatsit between paragraphs/displays (vertical mode)
 }
 
 message ContentItem {
@@ -133,6 +147,11 @@ message ContentItem {
   optional int32 display_width  = 5;
   optional int32 display_indent = 6;
   optional int32 display_shift  = 7;
+
+  // marker (lax): a stream-level anchor between flow items, same side/n
+  // convention as the Node form (which carries in-paragraph markers).
+  optional string side = 8;
+  optional uint32 n    = 9;
 }
 
 message Document {
