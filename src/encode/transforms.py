@@ -386,8 +386,19 @@ def _rewrite_picture_svg(svg: str, prefix: str) -> tuple[str, float, float]:
     return inner.strip(), vb_w, vb_h
 
 
-def convert_pictures(data: dict, build_dir: Path) -> int:
-    """Turn every picture node's PDF into inline SVG, indexed per document."""
+def convert_pictures(data: dict, build_dir: Path,
+                     dropped: list | None = None) -> int:
+    """Turn every picture node's PDF into inline SVG, indexed per document.
+
+    (lax) `dropped`, when given, opts into tolerating image rules the
+    template hook never stamped — a plain \\includegraphics (a class logo,
+    an ORCID icon, a raster figure) rather than an externalised tikz
+    picture. Each such node keeps its width as a kern, so the line keeps
+    its shape, and its metrics are appended to `dropped` for the caller to
+    report; the drawing itself is not shown. Without `dropped` the stock
+    behaviour stands: the encode stops, because a silently blank picture
+    would have no other symptom.
+    """
     pictures = data.setdefault('pictures', [])
     by_file: dict[str, int] = {}
     converted = 0
@@ -398,13 +409,22 @@ def convert_pictures(data: dict, build_dir: Path) -> int:
             if n.get('type') == 'picture':
                 src = n.pop('file', None)
                 if not src:
-                    # Never silently blank the picture: an unstamped image means
-                    # the \pgfincludeexternalgraphics hook did not run, and the
-                    # drawing would vanish from the page with no other symptom.
-                    sys.exit(f'ERROR: picture node in {build_dir.name} has no source file — '
-                             f'the template hook did not record it (check that '
-                             f'Serializer.note_picture runs when '
-                             f'\\pgfincludeexternalgraphics does)')
+                    if dropped is None:
+                        # Never silently blank the picture: an unstamped image means
+                        # the \pgfincludeexternalgraphics hook did not run, and the
+                        # drawing would vanish from the page with no other symptom.
+                        sys.exit(f'ERROR: picture node in {build_dir.name} has no source file — '
+                                 f'the template hook did not record it (check that '
+                                 f'Serializer.note_picture runs when '
+                                 f'\\pgfincludeexternalgraphics does)')
+                    dropped.append({'width': n.get('width', 0),
+                                    'height': n.get('height', 0),
+                                    'depth': n.get('depth', 0)})
+                    width = n.get('width', 0)
+                    n.clear()
+                    n['type'] = 'kern'
+                    n['width'] = width
+                    continue
                 if src not in by_file:
                     pdf = build_dir / f'{src}.pdf'
                     out = build_dir / f'{src}.svg'
