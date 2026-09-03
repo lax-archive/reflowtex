@@ -221,8 +221,10 @@ def normalise_legacy_font_addressing(data: dict, fonts) -> int:
 
 # The dvisvgm invocation is injectable (lax): REFLOWTEX_DVISVGM, read per
 # call, names the command that converts one PDF to SVG with dvisvgm's CLI
-# contract. The trusted validation path points it at a wrapper that runs the
-# conversion inside the pinned TeX container, so no host dvisvgm is assumed.
+# contract. The trusted validation path pins it *shut* (a command that always
+# fails): every picture is converted before the encode runs, inside the pinned
+# TeX container and by a converter that is not dvisvgm at all, so reaching for
+# a host binary here would mean a picture silently missed that step.
 def dvisvgm_command() -> str:
     return os.environ.get('REFLOWTEX_DVISVGM', 'dvisvgm')
 
