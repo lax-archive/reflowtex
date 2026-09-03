@@ -14,6 +14,8 @@ None of these depend on any framework; they operate on the parsed dict and (for
 fonts) a Fonts instance from fonts.py.
 """
 
+import base64
+import binascii
 import os
 import re
 import subprocess
@@ -244,6 +246,13 @@ SVG_ALLOWED_ELEMENTS = frozenset({
     'text', 'tspan', 'textPath',
     'clipPath', 'mask', 'marker', 'pattern',
     'linearGradient', 'radialGradient', 'stop',
+    # (lax) 'image' carries a raster \includegraphics — a photograph, a
+    # plot exported as PNG — which has no vector form to convert to. It is
+    # admitted only with an inline data: URI whose *decoded bytes* are a
+    # PNG or a JPEG (see _svg_data_image_safe): no remote fetch, and in
+    # particular no data:image/svg+xml, which would smuggle a whole second
+    # document past this allowlist.
+    'image',
 })
 
 SVG_ALLOWED_ATTRIBUTES = frozenset({
@@ -281,11 +290,41 @@ def _svg_attribute_name(qualified: str) -> str | None:
     return None
 
 
+# (lax) The only non-fragment references an <image> may carry: an inline
+# raster, by media type *and* by magic number. Checking the declared type
+# alone would let `data:image/png;base64,<an SVG>` through to a browser that
+# sniffs; checking the bytes closes that. The cap is defense in depth — the
+# producer (the archive's in-image converter) downsamples and the bundle has
+# its own size cap — so it is generous and absolute rather than tuned.
+SVG_DATA_IMAGE_MAGIC = {
+    'data:image/png;base64,': b'\x89PNG\r\n\x1a\n',
+    'data:image/jpeg;base64,': b'\xff\xd8\xff',
+}
+SVG_DATA_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _svg_data_image_safe(value: str) -> bool:
+    """Whether `value` is an inline PNG or JPEG whose bytes match its type."""
+    for prefix, magic in SVG_DATA_IMAGE_MAGIC.items():
+        if not value.startswith(prefix):
+            continue
+        # base64 tolerates the line breaks MuPDF wraps its payload with.
+        payload = ''.join(value[len(prefix):].split())
+        if len(payload) > 4 * (SVG_DATA_IMAGE_MAX_BYTES // 3 + 4):
+            return False
+        try:
+            raw = base64.b64decode(payload, validate=True)
+        except (binascii.Error, ValueError):
+            return False
+        return len(raw) <= SVG_DATA_IMAGE_MAX_BYTES and raw.startswith(magic)
+    return False
+
+
 def _svg_attribute_safe(name: str, value: str) -> bool:
     if name not in SVG_ALLOWED_ATTRIBUTES:
         return False
     if name in ('href', 'xlink:href'):
-        return value.startswith('#')
+        return value.startswith('#') or _svg_data_image_safe(value)
     for m in SVG_URL_REF_RE.finditer(value):
         if not m.group(2).startswith('#'):
             return False
@@ -428,14 +467,18 @@ def convert_pictures(data: dict, build_dir: Path,
                 if src not in by_file:
                     pdf = build_dir / f'{src}.pdf'
                     out = build_dir / f'{src}.svg'
-                    if not pdf.exists():
-                        sys.exit(f'ERROR: picture {pdf} missing — did tikz externalisation run?')
-                    # (lax) A pre-converted `<src>.svg` beside the PDF is consumed
-                    # as-is: the trusted validation path converts every picture
-                    # inside the pinned TeX image right after the compile, so the
-                    # encode host needs no dvisvgm at all. The sanitiser below
-                    # still runs on every consumed SVG, whoever produced it.
+                    # (lax) A pre-converted `<src>.svg` is consumed as-is: the
+                    # trusted validation path converts every picture inside the
+                    # pinned TeX image right after the compile, so the encode
+                    # host needs no dvisvgm at all. It is checked *before* the
+                    # PDF, because a converted picture need not have come from
+                    # a PDF beside it — a plain \includegraphics resolves its
+                    # file anywhere the run could read it (and may be a raster),
+                    # and only its SVG is handed over. The sanitiser below still
+                    # runs on every consumed SVG, whoever produced it.
                     if not out.exists():
+                        if not pdf.exists():
+                            sys.exit(f'ERROR: picture {pdf} missing — did tikz externalisation run?')
                         # --tmpdir is required for correctness, not tidiness: dvisvgm's
                         # temporary files are not namespaced per process, so concurrent
                         # conversions (blocks compile on a thread pool) collide and some

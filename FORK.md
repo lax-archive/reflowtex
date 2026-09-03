@@ -35,7 +35,12 @@ uses it to build the reflow view shown beside each submitted paper's PDF.
   `strip_unsupported_nodes`; every converted picture passes an
   element/attribute-allowlist SVG sanitizer; the dvisvgm invocation is
   injectable per call (`REFLOWTEX_DVISVGM`); a pre-converted `<src>.svg`
-  beside a picture's PDF is consumed as-is, still sanitized.
+  is consumed as-is, still sanitized, and now *without* requiring a PDF
+  beside it (a plain `\includegraphics` may be a raster, and only its
+  converted SVG is handed over); and the sanitizer admits an `image`
+  element whose `href`/`xlink:href` is an inline `data:` PNG or JPEG whose
+  decoded bytes carry the matching magic number — every other reference,
+  `data:image/svg+xml` included, still goes.
 - **Map-aware, injectable Type1 lookup** (`src/encode/t1_convert.py`):
   `find_outline` resolves a legacy face the way the engines do, through
   its `pdftex.map` line — outline plus, for a re-encoded face, the
