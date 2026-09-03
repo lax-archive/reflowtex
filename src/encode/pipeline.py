@@ -16,8 +16,10 @@ One snippet → one `build/<key>/` directory holding input.tex, the lualatex run
 output.json and nodelist.pb, so a rebuild can skip unchanged snippets and the
 intermediate artefacts are there to inspect when something looks wrong.
 
-Requires: lualatex, dvisvgm, protoc on PATH; the Python packages in
-requirements.txt (protobuf, fonttools).
+Requires: lualatex on PATH; a dvisvgm (its command injectable per call —
+REFLOWTEX_DVISVGM, see transforms.py); the Python packages in
+requirements.txt (protobuf, fonttools). protoc is *not* needed at run time
+(lax): latex_pb2.py is regenerated from the schema into build/ at fetch time.
 """
 
 import base64
@@ -37,6 +39,10 @@ ENCODE_DIR   = SRC_ROOT / 'encode'
 DEFAULT_TEMPLATE   = EXTRACT_DIR / 'template.tex'
 DEFAULT_SERIALIZER = EXTRACT_DIR / 'serializer.lua'
 DEFAULT_PROTO      = SCHEMA_DIR / 'latex.proto'
+
+# lax: fetch-time artefacts — the latex_pb2.py regenerated from the (patched)
+# schema lives here, not in src/encode/ (encode_pb prefers this copy on import).
+BUILD_DIR          = SRC_ROOT.parent / 'build'
 
 # encode_pb / transforms / fonts import each other and latex_pb2 by bare name.
 sys.path.insert(0, str(ENCODE_DIR))
@@ -80,19 +86,19 @@ class Pipeline:
 
     # ── schema ────────────────────────────────────────────────────────────────
     def _ensure_pb2(self):
-        """Regenerate latex_pb2.py from the .proto when missing or stale, so the
-        encoder is always in step with the schema of record."""
-        pb2 = ENCODE_DIR / 'latex_pb2.py'
-        if pb2.exists() and pb2.stat().st_mtime >= self.proto.stat().st_mtime:
-            return
-        try:
-            subprocess.run(
-                ['protoc', f'--proto_path={self.proto.parent}',
-                 f'--python_out={ENCODE_DIR}', self.proto.name],
-                check=True)
-        except FileNotFoundError:
-            sys.exit('protoc not found — install it (e.g. "apt-get install protobuf-compiler")')
-        print(f'  protoc: regenerated {pb2.name}')
+        """Verify the generated module exists — never (re)generate it here (lax).
+
+        latex_pb2.py is a fetch-time artefact: the fetch step regenerates it
+        from the (patched) schema into build/ with the pinned toolchain. The
+        stock mtime trigger rewrote it *into this tree* whenever a fresh
+        clone's checkout order left the proto marginally newer — a write into
+        what may be a read-only, digest-pinned vendored checkout. So run time
+        only checks, loudly."""
+        pb2 = BUILD_DIR / 'latex_pb2.py'
+        if not pb2.exists():
+            sys.exit(f'{pb2} is missing — run the fetch step, which regenerates it '
+                     f'from latex.proto with the pinned protoc; the pipeline never '
+                     f'writes into its own tree at run time')
 
     def schema_bytes(self) -> bytes:
         """The .proto text the browser parses at runtime (embed it once per page)."""
@@ -154,7 +160,7 @@ class Pipeline:
             if n_pictures:  bits.append(f'converted {n_pictures} picture(s)')
             print(f'  {key}: ' + ', '.join(bits))
 
-        blob = encode_pb.build_document(data).SerializeToString()
+        blob = encode_pb.serialize_document(data)   # lax: deterministic
         (build_dir / 'nodelist.pb').write_bytes(blob)
         return blob
 
