@@ -66,6 +66,137 @@ local function note_font(font_id)
     }
 end
 
+-- ── Glyph text ────────────────────────────────────────────────────────────
+-- lax: a glyph's codepoint is not always its text. An OpenType face keeps
+-- its ligatures (T_h, f_t, f_f_i), small caps (m.sc) and old-style figures
+-- (seven.taboldstyle) at private-use codepoints when Unicode has no slot for
+-- them (Libertine's cmap places them at U+E0xx), and even a ligature with a
+-- Unicode slot (U+FB03) reads as three letters. luaotfload knows the text:
+-- `characters[c].unicode` is a codepoint, or a table of codepoints for a
+-- ligature the loader analysed, and `descriptions[c].name` is the glyph
+-- name, whose AGL-style form (`T_h`, `uni0041.sc`, `seven.oldstyle`)
+-- decomposes. The text is recorded beside the glyph — `char` stays what it
+-- is, so rendering is untouched — and only when it differs from the
+-- codepoint's own text, so the wire form grows nowhere else.
+local AGL_NAMES = {
+    space = 0x20, exclam = 0x21, quotedbl = 0x22, numbersign = 0x23,
+    dollar = 0x24, percent = 0x25, ampersand = 0x26, quotesingle = 0x27,
+    quoteright = 0x2019, quoteleft = 0x2018, parenleft = 0x28,
+    parenright = 0x29, asterisk = 0x2A, plus = 0x2B, comma = 0x2C,
+    hyphen = 0x2D, period = 0x2E, slash = 0x2F, zero = 0x30, one = 0x31,
+    two = 0x32, three = 0x33, four = 0x34, five = 0x35, six = 0x36,
+    seven = 0x37, eight = 0x38, nine = 0x39, colon = 0x3A, semicolon = 0x3B,
+    less = 0x3C, equal = 0x3D, greater = 0x3E, question = 0x3F, at = 0x40,
+    bracketleft = 0x5B, backslash = 0x5C, bracketright = 0x5D,
+    asciicircum = 0x5E, underscore = 0x5F, grave = 0x60, braceleft = 0x7B,
+    bar = 0x7C, braceright = 0x7D, asciitilde = 0x7E, germandbls = 0xDF,
+    ae = 0xE6, AE = 0xC6, oe = 0x153, OE = 0x152, oslash = 0xF8,
+    Oslash = 0xD8, eth = 0xF0, Eth = 0xD0, thorn = 0xFE, Thorn = 0xDE,
+    dotlessi = 0x131, dotlessj = 0x237, lslash = 0x142, Lslash = 0x141,
+    endash = 0x2013, emdash = 0x2014, fi = 0xFB01, fl = 0xFB02,
+    ff = 0xFB00, ffi = 0xFB03, ffl = 0xFB04, longs = 0x17F,
+}
+for c = 0x41, 0x5A do AGL_NAMES[string.char(c)] = c end
+for c = 0x61, 0x7A do AGL_NAMES[string.char(c)] = c end
+-- Accented letters by their AGL names: <letter><accent> (eacute, Ccedilla),
+-- emitted as the base letter plus the combining mark, which the oracle's
+-- NFD fold strips exactly as it strips the precomposed form's.
+local AGL_ACCENTS = {
+    grave = 0x300, acute = 0x301, circumflex = 0x302, tilde = 0x303,
+    macron = 0x304, breve = 0x306, dotaccent = 0x307, dieresis = 0x308,
+    ring = 0x30A, hungarumlaut = 0x30B, caron = 0x30C, cedilla = 0x327,
+    ogonek = 0x328,
+}
+local SMALLCAP_SUFFIX = { sc = true, smcp = true, c2sc = true, scmp = true }
+
+local function safe_char(cp)
+    if type(cp) ~= "number" or cp < 0 or cp > 0x10FFFF then return nil end
+    return utf8.char(cp)
+end
+local function is_pua(cp)
+    return (cp >= 0xE000 and cp <= 0xF8FF) or cp >= 0xF0000
+end
+
+-- One AGL component (no suffix, no underscore) to text, or nil.
+local function agl_component(name)
+    local cp = AGL_NAMES[name]
+    if cp then return utf8.char(cp) end
+    local hex = name:match("^uni(%x%x%x%x)$") or name:match("^u(%x%x%x%x%x?%x?)$")
+    if hex then
+        cp = tonumber(hex, 16)
+        if cp and not is_pua(cp) then return safe_char(cp) end
+        return nil
+    end
+    local base, accent = name:match("^([A-Za-z])(%a+)$")
+    if base and AGL_ACCENTS[accent] then
+        return base .. utf8.char(AGL_ACCENTS[accent])
+    end
+    return nil
+end
+
+-- A glyph name to text: strip one `.suffix`, split on `_`, decompose each
+-- part; nil unless every part is known. Small-cap variants read as
+-- lowercase text.
+local function text_from_name(name)
+    if type(name) ~= "string" or name == "" or name == ".notdef" then return nil end
+    local stem, suffix = name:match("^([^.]+)%.(.+)$")
+    if not stem then stem = name end
+    local parts = {}
+    for part in stem:gmatch("[^_]+") do
+        local t = agl_component(part)
+        if not t then return nil end
+        parts[#parts + 1] = t
+    end
+    if #parts == 0 then return nil end
+    local text = table.concat(parts)
+    if suffix and SMALLCAP_SUFFIX[suffix:match("^(%a+)")] then
+        text = text:lower()
+    end
+    return text
+end
+
+local text_cache = {}   -- font id → { char → text or false }
+
+local function glyph_text(font_id, char)
+    local per_font = text_cache[font_id]
+    if not per_font then per_font = {}; text_cache[font_id] = per_font end
+    local cached = per_font[char]
+    if cached ~= nil then return cached or nil end
+    local text = nil
+    local f = font.getfont(font_id)
+    local fmt = f and f.format
+    if f and (fmt == "opentype" or fmt == "truetype") then
+        local cinfo = f.characters and f.characters[char]
+        local desc  = f.descriptions and f.descriptions[char]
+        local uni = cinfo and cinfo.unicode
+        if uni == nil and desc then uni = desc.unicode end
+        if type(uni) == "table" then
+            local parts = {}
+            for _, cp in ipairs(uni) do
+                local ch = type(cp) == "number" and not is_pua(cp) and safe_char(cp)
+                if not ch then parts = nil; break end
+                parts[#parts + 1] = ch
+            end
+            if parts and #parts > 0 then text = table.concat(parts) end
+        elseif type(uni) == "number" and uni ~= char and not is_pua(uni) then
+            text = safe_char(uni)
+        end
+        if not text then
+            text = text_from_name(desc and desc.name)
+        end
+        -- A small-cap glyph whose codepoint route yielded a capital (a
+        -- c2sc variant carrying its capital's unicode) still reads lowercase.
+        local dname = desc and desc.name
+        if text and type(dname) == "string" then
+            local suffix = dname:match("%.(%a+)")
+            if suffix and SMALLCAP_SUFFIX[suffix] then text = text:lower() end
+        end
+        if text and text == safe_char(char) then text = nil end
+    end
+    per_font[char] = text or false
+    return text
+end
+
 -- ── Colour tracking ───────────────────────────────────────────────────────
 -- xcolor's \color emits pdf_colorstack whatsits (push/pop/set with a PDF
 -- colour operator string). We simulate the stack during the document-order
@@ -126,6 +257,10 @@ end
 local PIC_ATTR    = 902
 local CITE_ATTR   = 903   -- glyphs of a citation number \lrcite{...}
 local CITETGT_ATTR = 904  -- glyphs of a bibliography label [n]
+-- lax: laxreflow.sty stamps the kernel's \@outputbox with this attribute
+-- just before \@outputpage assembles the page around it (Serializer.mark_body),
+-- so the shipout walk can find the body positively instead of by anatomy.
+local BODY_ATTR   = 905
 local RULE_IMAGE  = 2
 local picture_files = {}
 
@@ -144,6 +279,10 @@ end
 Serializer = Serializer or {}
 function Serializer.note_picture(id, file)
     picture_files[id] = file
+end
+function Serializer.mark_body(boxnum)
+    local b = tex.box[boxnum]
+    if b and node.type(b.id) == "vlist" then node.set_attribute(b, BODY_ATTR, 1) end
 end
 
 -- ── Transforms ────────────────────────────────────────────────────────────
@@ -238,6 +377,7 @@ local function serialize_nodelist(head)
             cur[#cur + 1] = {
                 type   = "glyph",
                 char   = n.char,
+                text   = glyph_text(n.font, n.char),   -- lax: see "Glyph text"
                 gindex = cinfo and cinfo.index or nil,
                 font   = n.font,
                 width  = n.width,
@@ -1072,6 +1212,28 @@ Serializer = Serializer or {}   -- note_picture already added a table above; do 
 -- vlist there (the \@outputbox, normally exactly one) is walked. A page with
 -- no frame vlist at all — a class with its own output routine — is walked
 -- whole, as before; its furniture then surfaces as content.
+--
+-- lax: that anatomy is a heuristic (a head box of a changed \headheight, a
+-- class that builds its page differently). When laxreflow.sty has stamped
+-- the \@outputbox (BODY_ATTR, set on the box node just before \@outputpage
+-- moves it into the page), the walk prefers the stamped vlists — every one
+-- found anywhere in the shipped tree, in order, never descending into one —
+-- and falls back to the anatomy only when the page carries none.
+local body_route_logged = false
+local function body_vlists(head, out)
+    for n in node.traverse(head) do
+        local t = node.type(n.id)
+        if (t == "vlist" or t == "hlist") then
+            if t == "vlist" and node.get_attribute(n, BODY_ATTR) == 1 then
+                out[#out + 1] = n
+            else
+                body_vlists(n.head, out)
+            end
+        end
+    end
+    return out
+end
+
 function Serializer.shipout(boxnum)
     local b = tex.box[boxnum]
     if not b then
@@ -1079,6 +1241,18 @@ function Serializer.shipout(boxnum)
         return
     end
     local pending = { sp = 0, explicit = 0, body_seen = false }
+    local bodies = body_vlists(b.head, {})
+    if not body_route_logged then
+        body_route_logged = true
+        texio.write_nl(string.format("serializer: page body located by %s",
+            #bodies > 0 and "attribute (laxreflow \\@outputpage stamp)" or "output-routine anatomy"))
+    end
+    if #bodies > 0 then
+        for _, body in ipairs(bodies) do
+            walk_page(body.head, pending, body.width)
+        end
+        return
+    end
     local frames = {}
     for n in node.traverse(b.head) do
         if node.type(n.id) == "vlist" then frames[#frames + 1] = n end

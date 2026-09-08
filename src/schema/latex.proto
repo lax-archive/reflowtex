@@ -127,6 +127,11 @@ message Paragraph {
   // (\raggedright), or "right" (\raggedleft). Absent = justified (the default),
   // so the paragraph inherits the block's --latex-align.
   optional string align = 6;
+  // sp; the width of the \parshape band `indent` starts at. Lists, quote and
+  // the abstract inset both sides, and only this states the second one: the
+  // right inset is hsize - indent - width. Absent in bundles sealed before
+  // the field existed, which the renderer reads as "no right inset".
+  optional int32 width = 7;
 }
 
 enum ItemKind {
