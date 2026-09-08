@@ -483,14 +483,25 @@ end
 -- lives in the box's shift; the renderer ignores it and re-centres at the
 -- reader's width.
 --
--- Subtypes we key on (hlist): line=1, alignment=4, equation=6.
-local HL_LINE, HL_ALIGNMENT, HL_EQUATION = 1, 4, 6
+-- Subtypes we key on (hlist): line=1, box=2, alignment=4, equation=6. Every
+-- other hlist subtype met in a vertical list (unknown=0, the math-internal
+-- ones never are) is treated as a plain box.
+local HL_LINE, HL_BOX, HL_ALIGNMENT, HL_EQUATION = 1, 2, 4, 6
 -- Vertical glue subtype 0 is userskip: the glue \vskip/\vspace/\addvspace insert,
 -- and the before/after skips \@startsection puts around a section heading. That
 -- is *explicit* spacing the author asked for, and it is preserved. Every other
 -- subtype here (baselineskip=2, lineskip=1, parskip=3) is interline leading the
 -- renderer re-derives per line, so it is dropped between text paragraphs.
 local GLUE_USERSKIP = 0
+-- The glue TeX appends to every paragraph before breaking it (0pt plus 1fil by
+-- default). The renderer keys the paragraph's end on this subtype, so a
+-- paragraph synthesized from a box (below) is given one too.
+local GLUE_PARFILLSKIP = 15
+-- TeX's "running dimension" sentinel: a rule dimension of -2^30 sp means "as
+-- wide/tall as the enclosing box" (an \hrule's width, a \vrule's height).
+local RUNNING = -1073741824
+-- LuaTeX's glue orders are fi=1, fil=2, fill=3, filll=4 (one more than TeX82).
+local ORDER_FIL = 2
 
 -- A display's box width is not what it occupies. \[..\] packs at natural
 -- width and is centred by its shift, while amsmath centres an alignment by
@@ -514,6 +525,10 @@ local GLUE_USERSKIP = 0
 -- every baselineskip TeX would have inserted — it changes the document rather
 -- than observing it.
 
+-- `content` is the stream being appended to. It is the body stream except
+-- while a footnote's vertical list is walked (see note_inserts), when it is
+-- swapped for the endnote stream; every emitter below reads it through this
+-- upvalue so the same walk serves both.
 local content   = {}
 local seen_para = {}
 
@@ -524,11 +539,17 @@ local seen_para = {}
 -- dropped every paragraph whose only ink is an externalised picture (a
 -- standalone tikzpicture between blank lines is exactly that: an hlist
 -- holding one picture rule, no glyph at any depth). Body content is
--- anything bearing glyphs OR pictures; a capture with neither still takes
--- the marker-hoist branch below.
+-- anything bearing glyphs, pictures, OR rules with area — the
+-- `\rule{3cm}{1cm}` figure placeholder, a `\noindent\rule{\textwidth}{0.4pt}`
+-- separator; a strut (`\rule{0pt}{2ex}`) has no width and is not ink. A
+-- capture with none still takes the marker-hoist branch below.
+local function rule_has_area(n)
+    return (n.height or 0) > 0 and ((n.width or 0) > 0 or n.width == RUNNING)
+end
 local function has_ink(nodes)
     for _, n in ipairs(nodes) do
         if n.type == "glyph" or n.type == "picture" then return true end
+        if n.type == "rule" and rule_has_area(n) then return true end
         if n.children and has_ink(n.children) then return true end
         if n.replace and has_ink(n.replace) then return true end
     end
@@ -550,94 +571,395 @@ local function last_flow()
     return nil
 end
 
+-- lax: an inkless capture (or box) is skipped, but a marker whatsit inside it
+-- (e.g. `\end{equation}` directly followed by the end marker and then a blank
+-- line — the resumed paragraph holds only the whatsit) must not vanish with
+-- it: hoist its markers into the stream at this position.
+local function hoist_markers(nodes)
+    for _, it in ipairs(nodes) do
+        if it.type == "marker" then
+            content[#content + 1] = { kind = "marker", side = it.side, n = it.n }
+        end
+        if it.children then hoist_markers(it.children) end
+        if it.replace then hoist_markers(it.replace) end
+    end
+end
+
 -- The band of the most recent paragraph; displays inherit it.
 local cur_band = { indent = 0, width = 0 }
+-- The interline parameters of the most recent real paragraph the walk met. A
+-- paragraph synthesized from a box at shipout time cannot read them itself:
+-- \@outputpage zeroes \baselineskip/\lineskip/\lineskiplimit around the page
+-- box, so the values in force during the walk are the page's, not the text's.
+local cur_leading = nil
 
-local function walk_page(head, pending)
+-- ── Footnotes → endnotes ──────────────────────────────────────────────────
+-- TeX floats every \insert to the bottom of the page (or column) it lands on,
+-- so a page walk meets the footnote lines *after* every body line of that
+-- page, with the \footnoterule before them. In a pageless flow that scatters
+-- footnotes at arbitrary points of the text. The web presentation chosen here
+-- is endnotes: footnotes are kept out of the body stream where TeX put them
+-- and appended at the very end, in document order, behind a rule display.
+-- (An in-viewer popover on the footnote mark would be a later refinement; the
+-- stream already carries everything it would need — the mark is a glyph in
+-- the body paragraph, the label `[1]` in the footnote paragraph's own nodes.)
+--
+-- Recognition happens where the \insert is still a node: buildpage_filter
+-- fires each time TeX is about to move contributions onto the page, and at
+-- that moment the contribution list holds every `ins` node appended since —
+-- the ones the line breaker migrated out of a paragraph's lines (a \footnote
+-- in text) and the ones \footnotetext appended in vertical mode (\thanks,
+-- which \maketitle runs between paragraphs). The insert's vertical list is
+-- complete by then, its lines stamped by their own pre_linebreak fire, so its
+-- paragraph indices are recorded in footnote_paras and the list is walked
+-- into the endnote stream right away. The page walk later meets those lines
+-- at a page bottom and skips them, and drops the \footnoterule with the
+-- \skip\footins above it.
+local footnote_paras   = {}     -- paragraph index → true
+local footnote_content = {}     -- the endnote stream, walked per insert
+local footnote_pending = { sp = 0, explicit = 0, body_seen = true }
+-- What separates the endnotes from the body: TeX's own \footnoterule (the
+-- first one the page walk drops — its width is the class's, .4\columnwidth
+-- for the standard classes) with \skip\footins above it and the rule's own
+-- trailing kern below.
+local endnote_sep = nil
+
+local function collect_paras(head, out, seen)
+    for n in node.traverse(head) do
+        local v = node.get_attribute(n, PARA_ATTR)
+        if v and not seen[v] then seen[v] = true; out[#out + 1] = v end
+        local t = node.type(n.id)
+        if t == "hlist" or t == "vlist" then collect_paras(n.head, out, seen) end
+    end
+    return out
+end
+
+-- Does a footnote line follow this node (through glue/kern/penalty/whatsit
+-- only)? True exactly for the \footnoterule at a page bottom.
+local function footnote_line_follows(n)
+    local c = n.next
+    while c do
+        local t = node.type(c.id)
+        if t == "hlist" then
+            local p = find_para(c)
+            return p ~= nil and footnote_paras[p] == true
+        elseif t ~= "glue" and t ~= "kern" and t ~= "penalty" and t ~= "whatsit" then
+            return false
+        end
+        c = c.next
+    end
+    return false
+end
+
+-- ── Emitters ──────────────────────────────────────────────────────────────
+-- The spacing rules around a paragraph and a display, shared by every branch
+-- of the walk that produces one (real lines, synthesized boxes, equations,
+-- vertical rules).
+
+local function emit_paragraph(p, pending)
+    seen_para[p] = true
+    local lf = last_flow()   -- lax: look through marker items
+    if not pending.body_seen then
+        -- First body line on this page: the glue above it is page
+        -- furniture — the top margin, the running header, and \headsep —
+        -- which TeX discards at the top of a page. We shipout-walk whole
+        -- pages and concatenate them, so discard it here too; otherwise
+        -- it surfaces as a ~40pt gap at every page break in the reflowed
+        -- output (16pt top margin + 25pt \headsep, say).
+        pending.body_seen = true
+        -- One exception: if the previous page ended with a display, its
+        -- \belowdisplayskip was discarded at the break along with the
+        -- furniture. In the reflowed (pageless) output the display and
+        -- this paragraph are adjacent, so restore that skip — TeX's own
+        -- parameter, not a guessed constant — or they abut too tightly.
+        if lf and lf.kind == "display" then
+            emit_vspace(lf.below_skip or 0)
+        end
+    elseif lf and lf.kind == "display" then
+        -- Abutting a display, keep TeX's full glue: above/belowdisplayskip
+        -- carries the display's spacing.
+        emit_vspace(pending.sp)
+    else
+        -- Between text paragraphs keep only explicit vspace: baselineskip
+        -- leading is re-derived per line, but a \vspace or a section's
+        -- before/after skip must survive.
+        emit_vspace(pending.explicit)
+    end
+    content[#content + 1] = { kind = "paragraph", para = p }
+    pending.sp = 0
+    pending.explicit = 0
+end
+
+-- `above_skip` is the \abovedisplayskip to restore when the display opens a
+-- page after a paragraph (an equation's); a vertical rule has none.
+local function emit_display(item, above_skip, pending)
+    local lf = last_flow()   -- lax: look through marker items
+    if pending.body_seen then
+        emit_vspace(pending.sp)
+    elseif lf and lf.kind == "paragraph" then
+        -- Display first on a page after a paragraph on the previous page:
+        -- its \abovedisplayskip was discarded with the furniture at the
+        -- break. Restore it (the symmetric case to belowdisplayskip above).
+        emit_vspace(above_skip)
+    elseif lf and lf.kind == "display" then
+        -- Two displays split by a page break (no glyph-bearing paragraph
+        -- between them, so they are adjacent in the stream). In continuous
+        -- flow TeX separates them by \belowdisplayskip + \abovedisplayskip;
+        -- both were discarded at the break (one as the page-bottom breakpoint
+        -- glue, the other as top-of-page furniture), so without this the two
+        -- displays abut. Restore the pair so the join matches unbroken flow.
+        emit_vspace((lf.below_skip or 0) + above_skip)
+    end
+    pending.body_seen = true
+    pending.sp = 0
+    pending.explicit = 0
+    content[#content + 1] = item
+end
+
+local function display_box(n, children)
+    return {
+        type       = "hlist",
+        subtype    = n.subtype,
+        width      = n.width,
+        height     = n.height,
+        depth      = n.depth,
+        glue_set   = n.glue_set,
+        glue_sign  = n.glue_sign,
+        glue_order = n.glue_order,
+        children   = children,
+    }
+end
+
+-- A vertical rule (\hrule, a class's title rule, a \footnoterule outside the
+-- footnote block) as a display: a box of the rule's width holding the rule,
+-- with no display skips of its own — the glue TeX put around it is what
+-- `pending` carries. A running width is resolved here to the enclosing
+-- vertical list's width (TeX's own meaning of it), and the rule node gets
+-- that width explicitly because the renderer's hlist path paints a
+-- running-width rule at zero width.
+local function emit_rule_display(n, list_width, pending)
+    local w = n.width == RUNNING and list_width or n.width
+    local d = n.depth == RUNNING and 0 or n.depth
+    local rule = { type = "rule", width = w, height = n.height, depth = d, color = current_color }
+    emit_display({
+        kind = "display",
+        below_skip     = 0,
+        display_width  = cur_band.width > 0 and cur_band.width or w,
+        display_indent = cur_band.indent,
+        display_shift  = cur_band.indent,
+        box = {
+            type = "hlist", subtype = HL_BOX,
+            width = w, height = n.height, depth = d,
+            glue_set = 0, glue_sign = 0, glue_order = 0,
+            children = { rule },
+        },
+    }, 0, pending)
+end
+
+-- ── Boxes in a vertical list ──────────────────────────────────────────────
+-- An \hbox appended in vertical mode is not a paragraph line: LaTeX's
+-- \@makecaption sets a short caption as \hbox to\hsize{\hfil …\hfil},
+-- \centerline is \hbox to\hsize{\hss …\hss}, several classes build their
+-- title block from boxes, and the two-column page itself is an \hbox holding
+-- the column vlists. Two shapes are told apart:
+--
+--   * a box holding vertical lists and no ink beside them — columns, or
+--     side-by-side \parbox/\vbox pairs — is walked column by column, each
+--     vlist in turn, so the stream keeps reading order (left column, then
+--     right);
+--   * any other box with ink becomes a *synthesized paragraph*: its
+--     serialized children, closed by a \parfillskip, entered in
+--     all_paragraphs with the box as its band and its alignment read from
+--     the box's own fill glue, then emitted like a real paragraph. It is
+--     never stamped on any TeX node, so find_para cannot return it and the
+--     walk cannot meet it twice.
+
+-- The vlists a box holds, looked for through nested plain boxes: LaTeX's
+-- two-column page is \hb@xt@\textwidth{\hb@xt@\columnwidth{\box\@leftcolumn
+-- \hss}\hfil\vrule\hfil\hb@xt@\columnwidth{\box\@outputbox\hss}}, so the
+-- columns sit one box down.
+local function column_vlists(head, out)
+    for c in node.traverse(head) do
+        local t = node.type(c.id)
+        if t == "vlist" then
+            out[#out + 1] = c
+        elseif t == "hlist" and c.subtype ~= HL_LINE and c.subtype ~= HL_EQUATION
+               and c.subtype ~= HL_ALIGNMENT then
+            column_vlists(c.head, out)
+        end
+    end
+    return out
+end
+
+-- Ink outside the vlists of a box (TeX-node level: glyphs, pictures, rules
+-- with area). The column separator is a \vrule of \columnseprule width and
+-- running height, which counts as ink only when the class gives it a width.
+local function ink_beside_vlists(head)
+    for c in node.traverse(head) do
+        local t = node.type(c.id)
+        if t == "glyph" then return true end
+        if t == "rule" and rule_has_area(c) then return true end
+        if t == "disc" and ink_beside_vlists(c.replace) then return true end
+        if t == "hlist" and ink_beside_vlists(c.head) then return true end
+    end
+    return false
+end
+
+-- Alignment of a box from its own fill glue, the way \centering/\raggedright
+-- express it through \leftskip/\rightskip: a fill on both sides is centred,
+-- a trailing one only is flush left, a leading one only flush right, none
+-- is the block default. (The fills stay in the paragraph and centre it in
+-- the renderer regardless; `align` is what a fill-less line falls back to.)
+local function box_align(nodes)
+    local function is_fill(n) return n.type == "glue" and (n.stretch_order or 0) > 0 end
+    local first, last
+    for i = 1, #nodes do
+        local n = nodes[i]
+        if n.type ~= "kern" and n.type ~= "penalty" and n.type ~= "whatsit"
+           and n.type ~= "marker" and n.type ~= "local_par" then
+            first = first or n
+            last = n
+        end
+    end
+    local ls = first and is_fill(first)
+    local rs = last and last ~= first and is_fill(last)
+    if ls and rs then return "center" end
+    if rs then return "left" end
+    if ls then return "right" end
+    return nil
+end
+
+-- \@makecaption keeps the caption text in a natural-width \sbox inside the
+-- \hbox to\hsize; as a rigid box it could not be re-broken for a reader
+-- narrower than it. A nested box that TeX packed at natural width, unshifted
+-- and with ink, is splice-flattened: its children advance the pen exactly as
+-- the box did, and become breakable. A box holding a rule directly
+-- (\rule{3cm}{1cm} is \hbox{\vrule ...}) stays rigid: the renderer measures a
+-- bare rule in a paragraph as zero-size, the box carries the metrics.
+local function has_direct_rule(nodes)
+    for _, c in ipairs(nodes) do if c.type == "rule" then return true end end
+    return false
+end
+local function flatten_boxes(nodes)
+    local out = {}
+    for _, n in ipairs(nodes) do
+        if n.type == "hlist" and (n.subtype == HL_BOX or n.subtype == 0)
+           and (n.glue_sign or 0) == 0 and (n.shift or 0) == 0
+           and has_ink(n.children) and not has_direct_rule(n.children) then
+            for _, c in ipairs(flatten_boxes(n.children)) do out[#out + 1] = c end
+        else
+            out[#out + 1] = n
+        end
+    end
+    return out
+end
+
+local function leading_for_synthesized()
+    if cur_leading then return cur_leading end
+    for i = #all_paragraphs, 1, -1 do
+        local p = all_paragraphs[i]
+        if not p.synthesized and not footnote_paras[i] then
+            return { baselineskip = p.baselineskip, lineskip = p.lineskip, lineskiplimit = p.lineskiplimit }
+        end
+    end
+    return { baselineskip = 0, lineskip = 0, lineskiplimit = 0 }
+end
+
+local function synthesize_paragraph(n, pending)
+    local nodes = serialize_nodelist(n.head)
+    if not has_ink(nodes) then
+        hoist_markers(nodes)
+        return
+    end
+    nodes = flatten_boxes(nodes)
+    local align = box_align(nodes)   -- from the box's own glue, before the parfillskip joins
+    nodes[#nodes + 1] = {
+        type = "glue", subtype = GLUE_PARFILLSKIP,
+        width = 0, stretch = 65536, stretch_order = ORDER_FIL, shrink = 0, shrink_order = 0,
+    }
+    local lead = leading_for_synthesized()
+    local idx = #all_paragraphs + 1
+    all_paragraphs[idx] = {
+        index  = idx,
+        indent = n.shift or 0,
+        width  = n.width,
+        baselineskip  = lead.baselineskip,
+        lineskip      = lead.lineskip,
+        lineskiplimit = lead.lineskiplimit,
+        align  = align,
+        nodes  = nodes,
+        synthesized = true,   -- bookkeeping only; not a schema field
+    }
+    -- cur_band is left alone: a box has no paragraph shape, and a
+    -- natural-width \hbox would narrow the band every later display inherits.
+    emit_paragraph(idx, pending)
+end
+
+-- ── The walk ──────────────────────────────────────────────────────────────
+-- `list_width` is the width of the vertical list being walked (what a
+-- running-width rule in it spans).
+local walk_page
+
+local function walk_columns(cols, pending)
+    -- Each column after the first is walked as a page: a column break is a
+    -- page break to TeX — the glue at the bottom of one column and the
+    -- \topskip furniture at the top of the next were both discarded — so the
+    -- top-of-page rules apply (furniture dropped, a display's below skip
+    -- restored). The first column continues the enclosing list: the glue
+    -- between whatever precedes the box (a two-column title block) and the
+    -- column's first line is real spacing. After the last column the walk
+    -- continues with no pending glue and the body counted as seen if any
+    -- column emitted something.
+    local had_body = pending.body_seen
+    for i, col in ipairs(cols) do
+        if i > 1 then
+            pending.body_seen = false
+            pending.sp = 0
+            pending.explicit = 0
+        end
+        walk_page(col.head, pending, col.width)
+        had_body = had_body or pending.body_seen
+    end
+    pending.body_seen = had_body
+    pending.sp = 0
+    pending.explicit = 0
+end
+
+walk_page = function(head, pending, list_width)
     for n in node.traverse(head) do
         local t = node.type(n.id)
         if t == "hlist" and n.subtype == HL_LINE then
             local p = find_para(n)
-            if p then
-                cur_band.indent = all_paragraphs[p].indent
-                cur_band.width  = all_paragraphs[p].width
-            end
-            if p and not seen_para[p] and has_ink(all_paragraphs[p].nodes) then
-                seen_para[p] = true
-                local lf = last_flow()   -- lax: look through marker items
-                if not pending.body_seen then
-                    -- First body line on this page: the glue above it is page
-                    -- furniture — the top margin, the running header, and \headsep —
-                    -- which TeX discards at the top of a page. We shipout-walk whole
-                    -- pages and concatenate them, so discard it here too; otherwise
-                    -- it surfaces as a ~40pt gap at every page break in the reflowed
-                    -- output (16pt top margin + 25pt \headsep, say).
-                    pending.body_seen = true
-                    -- One exception: if the previous page ended with a display, its
-                    -- \belowdisplayskip was discarded at the break along with the
-                    -- furniture. In the reflowed (pageless) output the display and
-                    -- this paragraph are adjacent, so restore that skip — TeX's own
-                    -- parameter, not a guessed constant — or they abut too tightly.
-                    if lf and lf.kind == "display" then
-                        emit_vspace(lf.below_skip or 0)
-                    end
-                elseif lf and lf.kind == "display" then
-                    -- Abutting a display, keep TeX's full glue: above/belowdisplayskip
-                    -- carries the display's spacing.
-                    emit_vspace(pending.sp)
-                else
-                    -- Between text paragraphs keep only explicit vspace: baselineskip
-                    -- leading is re-derived per line, but a \vspace or a section's
-                    -- before/after skip must survive.
-                    emit_vspace(pending.explicit)
+            if p and footnote_paras[p] then
+                -- A footnote line at the page bottom: already in the endnote
+                -- stream. The glue that came with the footnote block is not
+                -- body spacing, except what TeX put right under the rule,
+                -- which the endnote separator reproduces.
+                if endnote_sep and not endnote_sep.below then endnote_sep.below = pending.sp end
+                pending.sp = 0
+                pending.explicit = 0
+            else
+                if p then
+                    local para = all_paragraphs[p]
+                    cur_band.indent = para.indent
+                    cur_band.width  = para.width
+                    cur_leading = { baselineskip = para.baselineskip, lineskip = para.lineskip,
+                                    lineskiplimit = para.lineskiplimit }
                 end
-                content[#content + 1] = { kind = "paragraph", para = p }
-            end
-            if p and not seen_para[p] and not has_ink(all_paragraphs[p].nodes) then
-                -- lax: an inkless paragraph capture is skipped, but a
-                -- marker whatsit inside it (e.g. `\end{equation}` directly
-                -- followed by the end marker and then a blank line — the resumed
-                -- paragraph holds only the whatsit) must not vanish with it:
-                -- hoist its markers into the stream at this position.
-                seen_para[p] = true
-                local function hoist(nodes)
-                    for _, it in ipairs(nodes) do
-                        if it.type == "marker" then
-                            content[#content + 1] = { kind = "marker", side = it.side, n = it.n }
-                        end
-                        if it.children then hoist(it.children) end
-                        if it.replace then hoist(it.replace) end
-                    end
+                if p and not seen_para[p] and has_ink(all_paragraphs[p].nodes) then
+                    emit_paragraph(p, pending)
+                elseif p and not seen_para[p] then
+                    seen_para[p] = true
+                    hoist_markers(all_paragraphs[p].nodes)
                 end
-                hoist(all_paragraphs[p].nodes)
+                pending.sp = 0
+                pending.explicit = 0
             end
-            pending.sp = 0
-            pending.explicit = 0
         elseif t == "hlist" and (n.subtype == HL_EQUATION or n.subtype == HL_ALIGNMENT) then
-            local lf = last_flow()   -- lax: look through marker items
-            if pending.body_seen then
-                emit_vspace(pending.sp)
-            elseif lf and lf.kind == "paragraph" then
-                -- Display first on a page after a paragraph on the previous page:
-                -- its \abovedisplayskip was discarded with the furniture at the
-                -- break. Restore it (the symmetric case to belowdisplayskip above).
-                emit_vspace(param_dimen("abovedisplayskip"))
-            elseif lf and lf.kind == "display" then
-                -- Two displays split by a page break (no glyph-bearing paragraph
-                -- between them, so they are adjacent in the stream). In continuous
-                -- flow TeX separates them by \belowdisplayskip + \abovedisplayskip;
-                -- both were discarded at the break (one as the page-bottom breakpoint
-                -- glue, the other as top-of-page furniture), so without this the two
-                -- displays abut. Restore the pair so the join matches unbroken flow.
-                emit_vspace((lf.below_skip or 0) + param_dimen("abovedisplayskip"))
-            end
-            pending.body_seen = true
-            pending.sp = 0
-            pending.explicit = 0
-            content[#content + 1] = {
+            emit_display({
                 kind = "display",
                 -- \belowdisplayskip in force here, so a page break that discards it
-                -- (see the paragraph branch) can restore TeX's own value.
+                -- (see emit_paragraph) can restore TeX's own value.
                 below_skip = param_dimen("belowdisplayskip"),
                 -- The band this display occupies, and where TeX put the box
                 -- inside it. display_shift is carried out here rather than on
@@ -648,20 +970,34 @@ local function walk_page(head, pending)
                 display_width  = cur_band.width > 0 and cur_band.width or n.width,
                 display_indent = cur_band.indent,
                 display_shift  = n.shift or 0,
-                box  = {
-                    type       = "hlist",
-                    subtype    = n.subtype,
-                    width      = n.width,
-                    height     = n.height,
-                    depth      = n.depth,
-                    glue_set   = n.glue_set,
-                    glue_sign  = n.glue_sign,
-                    glue_order = n.glue_order,
-                    children   = n.head and serialize_nodelist(n.head) or {},
-                },
-            }
+                box  = display_box(n, n.head and serialize_nodelist(n.head) or {}),
+            }, param_dimen("abovedisplayskip"), pending)
+        elseif t == "hlist" then
+            -- A plain box in the vertical list (see "Boxes in a vertical list").
+            local cols = column_vlists(n.head, {})
+            if #cols > 0 and not ink_beside_vlists(n.head) then
+                walk_columns(cols, pending)
+            else
+                synthesize_paragraph(n, pending)
+            end
         elseif t == "vlist" then
-            walk_page(n.head, pending)
+            walk_page(n.head, pending, n.width)
+        elseif t == "rule" then
+            if rule_has_area(n) then
+                if footnote_line_follows(n) then
+                    -- The \footnoterule: it goes to the end with the footnotes
+                    -- it heads (the first one seen is the separator used
+                    -- there); the \skip\footins above it is not body spacing.
+                    if not endnote_sep then
+                        endnote_sep = { width = n.width, height = n.height,
+                                        depth = n.depth == RUNNING and 0 or n.depth }
+                    end
+                    pending.sp = 0
+                    pending.explicit = 0
+                else
+                    emit_rule_display(n, list_width, pending)
+                end
+            end
         elseif t == "glue" then
             pending.sp = (pending.sp or 0) + (n.width or 0)
             if n.subtype == GLUE_USERSKIP then
@@ -681,18 +1017,107 @@ local function walk_page(head, pending)
     end
 end
 
+-- The \skip\footins in force, read through the insert's class number (the
+-- `ins` node's subtype), so no LaTeX register number is assumed.
+local footnote_skip = nil
+local function note_inserts(extrainfo)
+    local head = tex.lists.contrib_head
+    if not head then return end
+    for n in node.traverse(head) do
+        if node.type(n.id) == "ins" and n.head then
+            local paras = collect_paras(n.head, {}, {})
+            local fresh = false
+            for _, p in ipairs(paras) do
+                if not footnote_paras[p] then fresh = true end
+            end
+            if fresh then
+                if not footnote_skip then
+                    local ok, w = pcall(tex.getglue, n.subtype)
+                    footnote_skip = ok and w or 0
+                end
+                -- Walk the insert's list into the endnote stream now; the
+                -- band and leading state belong to the body walk and are
+                -- kept out of its way.
+                local saved_content = content
+                local saved_band = { indent = cur_band.indent, width = cur_band.width }
+                local saved_leading = cur_leading
+                content = footnote_content
+                walk_page(n.head, footnote_pending, all_paragraphs[paras[1]].width)
+                -- Marked only now: the walk above must see these lines as
+                -- ordinary paragraphs; the page walk later must not.
+                for _, p in ipairs(paras) do footnote_paras[p] = true end
+                content = saved_content
+                cur_band.indent, cur_band.width = saved_band.indent, saved_band.width
+                cur_leading = saved_leading
+            end
+        end
+    end
+end
+
 Serializer = Serializer or {}   -- note_picture already added a table above; do not clobber it
 
+-- LaTeX's page (\@outputpage, ltoutput) is
+--   \vbox{ \@begindvi \vskip\topmargin
+--          \moveright\@themargin\vbox{ \vbox to\headheight{\vfil\hbox to\textwidth{\@thehead}}
+--                                      \vskip\headsep
+--                                      \box\@outputbox
+--                                      \baselineskip\footskip
+--                                      \hbox to\textwidth{\@thefoot} } }
+-- The running head and the foot carry ink (a page number, a running title)
+-- that must not become paragraphs now that boxes in a vertical list are
+-- content, so the body is located rather than the whole page walked: in each
+-- top-level vlist (the frame), the first vlist is the head box when it is
+-- packed to \headheight, hlists are the foot, and the glue between them is
+-- \headsep/\footskip — page furniture, never body spacing. Every other
+-- vlist there (the \@outputbox, normally exactly one) is walked. A page with
+-- no frame vlist at all — a class with its own output routine — is walked
+-- whole, as before; its furniture then surfaces as content.
 function Serializer.shipout(boxnum)
     local b = tex.box[boxnum]
     if not b then
         texio.write_nl("serializer: shipout box " .. tostring(boxnum) .. " is nil")
         return
     end
-    walk_page(b.head, { sp = 0, explicit = 0, body_seen = false })
+    local pending = { sp = 0, explicit = 0, body_seen = false }
+    local frames = {}
+    for n in node.traverse(b.head) do
+        if node.type(n.id) == "vlist" then frames[#frames + 1] = n end
+    end
+    if #frames == 0 then
+        walk_page(b.head, pending, b.width)
+        return
+    end
+    local headheight = tex.dimen.headheight or 0
+    for _, frame in ipairs(frames) do
+        local first = true
+        for c in node.traverse(frame.head) do
+            if node.type(c.id) == "vlist" then
+                if not (first and c.height == headheight) then
+                    walk_page(c.head, pending, c.width)
+                end
+                first = false
+            end
+        end
+    end
 end
 
 local function write_output()
+    -- The endnotes: TeX's own \footnoterule (see endnote_sep) with
+    -- \skip\footins above it, then every footnote in document order.
+    if #footnote_content > 0 then
+        local first_para
+        for _, it in ipairs(footnote_content) do
+            if it.kind == "paragraph" then first_para = all_paragraphs[it.para]; break end
+        end
+        local band_w = first_para and first_para.width or cur_band.width
+        local sep = endnote_sep or { width = math.floor(band_w * 0.4), height = 26214, depth = 0 }
+        local pending = { sp = footnote_skip or 0, explicit = footnote_skip or 0, body_seen = #content > 0 }
+        cur_band.indent = first_para and first_para.indent or 0
+        cur_band.width  = band_w
+        emit_rule_display({ width = sep.width, height = sep.height, depth = sep.depth }, band_w, pending)
+        emit_vspace(endnote_sep and endnote_sep.below or 0)
+        for _, it in ipairs(footnote_content) do content[#content + 1] = it end
+    end
     local f = assert(io.open("output.json", "w"))
     f:write(json_encode({
         fonts      = used_fonts,
@@ -710,4 +1135,5 @@ local function write_output()
 end
 
 luatexbase.add_to_callback("pre_linebreak_filter",   capture_paragraph, "capture_paragraph")
+luatexbase.add_to_callback("buildpage_filter",       note_inserts,      "note_inserts")
 luatexbase.add_to_callback("finish_pdffile",         write_output,       "write_output")
