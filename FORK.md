@@ -37,6 +37,14 @@ uses it to build the reflow view shown beside each submitted paper's PDF.
   carries `footnote = k` (`Paragraph.footnote`). The endnote emission is
   unchanged — a viewer with a margin rail sets footnote k beside its
   reference, the fallback stays endnotes.
+- **Heading skips at page tops** (`src/extract/serializer.lua`): a
+  heading that opens a page had its `\@startsection` beforeskip
+  discarded with the top-of-page furniture and was welded to the
+  paragraph before it. laxreflow.sty records the glue TeX left above the
+  heading (`\lastskip` as `\@sect`/`\@ssect` begin) in a whatsit
+  (user_id 90212) below that glue; the walk restores it when the heading
+  — or the paragraph a run-in `\paragraph` opens — is first on a page,
+  the same rule as the `\belowdisplayskip` restore.
 - **Encode hardening** (`src/encode/encode_pb.py`): prefer a regenerated
   `latex_pb2.py`, fail loudly on unknown enum values, and serialize
   deterministically through `serialize_document()`.

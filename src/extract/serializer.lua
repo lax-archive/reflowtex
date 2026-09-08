@@ -286,6 +286,11 @@ end
 -- user_defined whatsit with this user_id and the footnote's ordinal as its
 -- number value.
 local LAX_FOOTNOTE_REF_ID = 90211
+-- lax: laxreflow.sty's record of a section heading's skip — a user_defined
+-- whatsit with this user_id, written below the glue \@startsection's
+-- \addvspace left above the heading, its value that glue's width in sp
+-- (\lastskip as \@sect began). See "Heading skips" in the walk.
+local LAX_HEADING_SKIP_ID = 90212
 
 Serializer = Serializer or {}
 function Serializer.note_picture(id, file, page)
@@ -782,6 +787,22 @@ local function emit_vspace(sp)
     end
 end
 
+-- ── Heading skips ─────────────────────────────────────────────────────────
+-- lax: a section heading that opens a page had its \@startsection
+-- beforeskip discarded at the page top with the furniture, and the walk,
+-- which discards the furniture too, welded the heading — or the paragraph
+-- a run-in \paragraph heading opens — to the paragraph before it. The
+-- skip is not guessed back: laxreflow.sty records the glue TeX left above
+-- the heading (LAX_HEADING_SKIP_ID, \lastskip right after \addvspace, so
+-- already merged with a preceding display's below skip or a list's
+-- \topsep as \addvspace merges them) in a whatsit below that glue, which
+-- survives the break the glue does not. This is the most recent such
+-- record not yet answered by a line or display. Module-level rather than
+-- a `pending` field: a break can fall at the glue right after the whatsit
+-- (the same page as at \@secpenalty, chosen only on an awful_bad tie), so
+-- the whatsit may end one page and its heading open the next.
+local heading_skip = nil
+
 -- lax: markers (and footnote refs, the vertical-mode kind) must be
 -- transparent to the spacing logic below, so the "what did the stream just
 -- emit" questions skip over trailing marker items.
@@ -887,7 +908,12 @@ local function emit_paragraph(p, pending)
         -- furniture. In the reflowed (pageless) output the display and
         -- this paragraph are adjacent, so restore that skip — TeX's own
         -- parameter, not a guessed constant — or they abut too tightly.
-        if lf and lf.kind == "display" then
+        -- lax: the same rule for a heading's skip (see "Heading skips");
+        -- the recorded glue already includes a display's below skip when
+        -- the heading followed one, so it answers both.
+        if heading_skip then
+            emit_vspace(heading_skip)
+        elseif lf and lf.kind == "display" then
             emit_vspace(lf.below_skip or 0)
         end
     elseif lf and lf.kind == "display" then
@@ -903,6 +929,7 @@ local function emit_paragraph(p, pending)
     content[#content + 1] = { kind = "paragraph", para = p }
     pending.sp = 0
     pending.explicit = 0
+    heading_skip = nil
 end
 
 -- `above_skip` is the \abovedisplayskip to restore when the display opens a
@@ -928,6 +955,7 @@ local function emit_display(item, above_skip, pending)
     pending.body_seen = true
     pending.sp = 0
     pending.explicit = 0
+    heading_skip = nil
     content[#content + 1] = item
 end
 
@@ -1232,6 +1260,7 @@ local function walk_line(n, pending)
         if endnote_sep and not endnote_sep.below then endnote_sep.below = pending.sp end
         pending.sp = 0
         pending.explicit = 0
+        heading_skip = nil
     else
         if p then
             local para = all_paragraphs[p]
@@ -1248,6 +1277,7 @@ local function walk_line(n, pending)
         end
         pending.sp = 0
         pending.explicit = 0
+        heading_skip = nil
     end
 end
 
@@ -1363,6 +1393,11 @@ walk_page = function(head, pending, list_width)
             -- note_inserts in place of the insert the page builder removed.
             -- Emitted like a marker: in place, `pending` untouched.
             content[#content + 1] = { kind = "footnote_ref", n = n.value }
+        elseif t == "whatsit" and n.user_id == LAX_HEADING_SKIP_ID then
+            -- lax: the glue above a heading, as laxreflow.sty measured it
+            -- (see "Heading skips"); `pending` untouched — in unbroken flow
+            -- the glue itself is walked, and this is only read at a page top.
+            heading_skip = tonumber(n.value)
         end
     end
 end
