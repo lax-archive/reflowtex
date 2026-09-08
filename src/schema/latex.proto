@@ -37,6 +37,13 @@ enum NodeType {
   // name for marker nodes is `mark`; the serializer's JSON says
   // type:"marker" and encode_pb maps it.
   mark      = 11;
+  // lax: a footnote's reference point inside a paragraph — where its
+  // \footnote insert sat before the line breaker moved it out. No ink, no
+  // width; `n` is the footnote's ordinal, the `footnote` of its paragraphs.
+  // Same scoping rule as `mark`: ItemKind claims `footnote_ref` (the
+  // vertical-mode form), so the wire name here is `fnref`; the serializer's
+  // JSON says type:"footnote_ref" for both and encode_pb maps it.
+  fnref     = 12;
 }
 
 message Node {
@@ -88,6 +95,7 @@ message Node {
   // "b" (begin) or "e" (end); `n` is the mark number from the submission's
   // mark table (ids never enter the wire form). Zero-size and invisible: the
   // viewer exposes it as an anchor and the line breaker treats it as ink-free.
+  // fnref (lax) reuses `n` for the footnote ordinal.
   optional string   side          = 33;
   optional uint32   n             = 34;
 }
@@ -132,6 +140,12 @@ message Paragraph {
   // right inset is hsize - indent - width. Absent in bundles sealed before
   // the field existed, which the renderer reads as "no right inset".
   optional int32 width = 7;
+  // lax: set on a footnote's paragraphs to the footnote's ordinal k — the
+  // `n` of the `fnref` node or `footnote_ref` item at its reference point.
+  // The stream still carries these paragraphs as endnotes (the fallback
+  // rendering); a viewer with a margin rail sets them beside the reference.
+  // Absent on body paragraphs.
+  optional int32 footnote = 8;
 }
 
 enum ItemKind {
@@ -139,6 +153,10 @@ enum ItemKind {
   display   = 1;
   vspace    = 2;
   marker    = 3;  // lax: a \laxmark whatsit between paragraphs/displays (vertical mode)
+  // lax: a footnote reference with no paragraph to sit in (\thanks, a
+  // \footnotetext between paragraphs): emitted at the walk position, as a
+  // marker is. `n` is the footnote's ordinal.
+  footnote_ref = 4;
 }
 
 message ContentItem {
@@ -155,6 +173,7 @@ message ContentItem {
 
   // marker (lax): a stream-level anchor between flow items, same side/n
   // convention as the Node form (which carries in-paragraph markers).
+  // footnote_ref (lax) reuses `n` for the footnote ordinal.
   optional string side = 8;
   optional uint32 n    = 9;
 }

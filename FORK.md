@@ -28,6 +28,15 @@ uses it to build the reflow view shown beside each submitted paper's PDF.
 - **Marker forms in the wire schema** (`src/schema/latex.proto`): a
   `mark` NodeType and a `marker` ItemKind, each with `side`/`n`. Stock
   `encode_pb` dies with `KeyError: 'marker'` on a stream marker.
+- **Footnote references** (`src/extract/serializer.lua`,
+  `src/schema/latex.proto`): a footnote's insert at its reference point
+  becomes a `footnote_ref` node (wire name `fnref`, `n` = the footnote's
+  ordinal in encounter order); a vertical-mode insert (`\thanks`, a
+  `\footnotetext` between paragraphs) leaves a stand-in whatsit the walk
+  emits as a `footnote_ref` stream item; and each footnote paragraph
+  carries `footnote = k` (`Paragraph.footnote`). The endnote emission is
+  unchanged — a viewer with a margin rail sets footnote k beside its
+  reference, the fallback stays endnotes.
 - **Encode hardening** (`src/encode/encode_pb.py`): prefer a regenerated
   `latex_pb2.py`, fail loudly on unknown enum values, and serialize
   deterministically through `serialize_document()`.

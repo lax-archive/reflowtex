@@ -281,6 +281,11 @@ local function lax_marker(n)
     if not side then return nil end
     return side, tonumber(num)
 end
+-- lax: the stand-in note_inserts leaves in the vertical list for a footnote
+-- reference that has no paragraph to sit in (see "Footnote ordinals"): a
+-- user_defined whatsit with this user_id and the footnote's ordinal as its
+-- number value.
+local LAX_FOOTNOTE_REF_ID = 90211
 
 Serializer = Serializer or {}
 function Serializer.note_picture(id, file, page)
@@ -328,6 +333,54 @@ local function parse_matrix(data)
     local a, b, c, d = data:match("^%s*(%-?[%d%.]+)%s+(%-?[%d%.]+)%s+(%-?[%d%.]+)%s+(%-?[%d%.]+)")
     if not a then return nil end
     return { a = tonumber(a), b = tonumber(b), c = tonumber(c), d = tonumber(d) }
+end
+
+-- ── Footnote ordinals ─────────────────────────────────────────────────────
+-- lax: a footnote is numbered here by encounter order — k for the k-th
+-- insert the serializer meets — and that k ties its two halves together
+-- for a viewer that sets footnotes beside their references: the
+-- `footnote_ref` node (or stream item) at the reference point, and
+-- `footnote = k` on each paragraph of the footnote's text (note_inserts).
+-- An in-text \footnote is met twice: as an `ins` node in the paragraph
+-- being captured (pre_linebreak time, still at its reference point) and
+-- again in the contribution list once the line breaker has migrated it out
+-- behind its line. Node identity is not relied on across the two; the
+-- insert's vertical list is, through the paragraph indices its lines were
+-- stamped with by their own pre_linebreak fire (the footnote text is broken
+-- before the insert joins the enclosing paragraph), so the first of them
+-- keys the ordinal. An insert with no stamped paragraph (\footnote{} —
+-- nothing to place) gets no ordinal and no ref.
+--
+-- Each captured node is stamped with its paragraph index (PARA_ATTR, see
+-- "Paragraph capture") so the shipout walk can recognise the resulting
+-- lines; the same stamp is read here.
+local PARA_ATTR = 900
+local footnote_ordinals = {}   -- first paragraph index of an insert → k
+local footnote_count    = 0
+
+local function collect_paras(head, out, seen)
+    for n in node.traverse(head) do
+        local v = node.get_attribute(n, PARA_ATTR)
+        if v and not seen[v] then seen[v] = true; out[#out + 1] = v end
+        local t = node.type(n.id)
+        if t == "hlist" or t == "vlist" then collect_paras(n.head, out, seen) end
+    end
+    return out
+end
+
+-- The insert's ordinal (nil for a paragraphless one), its paragraph
+-- indices, and whether this call assigned the ordinal — true exactly when
+-- the insert was never met at capture time, i.e. it was appended in
+-- vertical mode (\thanks, \footnotetext between paragraphs).
+local function footnote_ordinal(ins)
+    local paras = collect_paras(ins.head, {}, {})
+    local first = paras[1]
+    if not first then return nil, paras, false end
+    local k = footnote_ordinals[first]
+    if k then return k, paras, false end
+    footnote_count = footnote_count + 1
+    footnote_ordinals[first] = footnote_count
+    return footnote_count, paras, true
 end
 
 -- ── Node serializer ───────────────────────────────────────────────────────
@@ -501,6 +554,18 @@ local function serialize_nodelist(head)
                 surround = n.surround,
             }
 
+        elseif t == "ins" then
+            -- lax: a footnote's insert, still at its reference point in the
+            -- paragraph being captured (see "Footnote ordinals"): no ink, no
+            -- width, only which footnote. A paragraphless insert stays the
+            -- bare node it always was (the encode strips it).
+            local k = footnote_ordinal(n)
+            if k then
+                cur[#cur + 1] = { type = "footnote_ref", n = k }
+            else
+                cur[#cur + 1] = { type = t }
+            end
+
         else
             cur[#cur + 1] = { type = t }
         end
@@ -530,7 +595,6 @@ end
 -- apart from math.
 
 local all_paragraphs = {}
-local PARA_ATTR      = 900
 
 local function stamp(head, idx)
     for n in node.traverse(head) do
@@ -718,11 +782,13 @@ local function emit_vspace(sp)
     end
 end
 
--- lax: markers must be transparent to the spacing logic below, so the
--- "what did the stream just emit" questions skip over trailing marker items.
+-- lax: markers (and footnote refs, the vertical-mode kind) must be
+-- transparent to the spacing logic below, so the "what did the stream just
+-- emit" questions skip over trailing marker items.
 local function last_flow()
     for i = #content, 1, -1 do
-        if content[i].kind ~= "marker" then return content[i] end
+        local k = content[i].kind
+        if k ~= "marker" and k ~= "footnote_ref" then return content[i] end
     end
     return nil
 end
@@ -735,6 +801,8 @@ local function hoist_markers(nodes)
     for _, it in ipairs(nodes) do
         if it.type == "marker" then
             content[#content + 1] = { kind = "marker", side = it.side, n = it.n }
+        elseif it.type == "footnote_ref" then
+            content[#content + 1] = { kind = "footnote_ref", n = it.n }
         end
         if it.children then hoist_markers(it.children) end
         if it.replace then hoist_markers(it.replace) end
@@ -756,9 +824,10 @@ local cur_leading = nil
 -- footnotes at arbitrary points of the text. The web presentation chosen here
 -- is endnotes: footnotes are kept out of the body stream where TeX put them
 -- and appended at the very end, in document order, behind a rule display.
--- (An in-viewer popover on the footnote mark would be a later refinement; the
--- stream already carries everything it would need — the mark is a glyph in
--- the body paragraph, the label `[1]` in the footnote paragraph's own nodes.)
+-- (lax: a viewer that sets footnote k beside its reference instead has what
+-- it needs — the `footnote_ref` node or stream item at the reference point
+-- and `footnote = k` on the footnote's paragraphs, see "Footnote ordinals";
+-- the endnote emission stays as the fallback for narrow widths.)
 --
 -- Recognition happens where the \insert is still a node: buildpage_filter
 -- fires each time TeX is about to move contributions onto the page, and at
@@ -779,16 +848,6 @@ local footnote_pending = { sp = 0, explicit = 0, body_seen = true }
 -- for the standard classes) with \skip\footins above it and the rule's own
 -- trailing kern below.
 local endnote_sep = nil
-
-local function collect_paras(head, out, seen)
-    for n in node.traverse(head) do
-        local v = node.get_attribute(n, PARA_ATTR)
-        if v and not seen[v] then seen[v] = true; out[#out + 1] = v end
-        local t = node.type(n.id)
-        if t == "hlist" or t == "vlist" then collect_paras(n.head, out, seen) end
-    end
-    return out
-end
 
 -- Does a footnote line follow this node (through glue/kern/penalty/whatsit
 -- only)? True exactly for the \footnoterule at a page bottom.
@@ -1052,7 +1111,7 @@ local function box_align(nodes)
     for i = 1, #nodes do
         local n = nodes[i]
         if n.type ~= "kern" and n.type ~= "penalty" and n.type ~= "whatsit"
-           and n.type ~= "marker" and n.type ~= "local_par" then
+           and n.type ~= "marker" and n.type ~= "footnote_ref" and n.type ~= "local_par" then
             first = first or n
             last = n
         end
@@ -1299,6 +1358,11 @@ walk_page = function(head, pending, list_width)
             -- the marker is unchanged.
             local side, num = lax_marker(n)
             content[#content + 1] = { kind = "marker", side = side, n = num }
+        elseif t == "whatsit" and n.user_id == LAX_FOOTNOTE_REF_ID then
+            -- lax: a vertical-mode footnote's reference point, left here by
+            -- note_inserts in place of the insert the page builder removed.
+            -- Emitted like a marker: in place, `pending` untouched.
+            content[#content + 1] = { kind = "footnote_ref", n = n.value }
         end
     end
 end
@@ -1311,12 +1375,32 @@ local function note_inserts(extrainfo)
     if not head then return end
     for n in node.traverse(head) do
         if node.type(n.id) == "ins" and n.head then
-            local paras = collect_paras(n.head, {}, {})
+            local k, paras, first_sight = footnote_ordinal(n)
             local fresh = false
             for _, p in ipairs(paras) do
                 if not footnote_paras[p] then fresh = true end
             end
             if fresh then
+                if first_sight then
+                    -- lax: an insert no capture met was appended in vertical
+                    -- mode (\thanks, \footnotetext between paragraphs) and
+                    -- has no paragraph to hold its reference. The page
+                    -- builder is about to remove the `ins` node itself, so
+                    -- a stand-in whatsit goes in front of it (insertion
+                    -- before never moves the list's tail) for the walk to
+                    -- emit as a `footnote_ref` stream item. Layout-neutral:
+                    -- zero-size, non-discardable exactly as the insert
+                    -- beside it, no effect on \prevdepth or breakpoints.
+                    local w = node.new("whatsit", "user_defined")
+                    w.user_id = LAX_FOOTNOTE_REF_ID
+                    w.type    = 100      -- a number value
+                    w.value   = k
+                    local new_head = node.insert_before(head, n, w)
+                    if new_head ~= head then
+                        tex.lists.contrib_head = new_head
+                        head = new_head
+                    end
+                end
                 if not footnote_skip then
                     local ok, w = pcall(tex.getglue, n.subtype)
                     footnote_skip = ok and w or 0
@@ -1331,14 +1415,16 @@ local function note_inserts(extrainfo)
                 walk_page(n.head, footnote_pending, all_paragraphs[paras[1]].width)
                 -- Marked only now: the walk above must see these lines as
                 -- ordinary paragraphs; the page walk later must not. The
-                -- paragraph entry carries the mark too (bookkeeping only,
-                -- like `synthesized`; not a schema field): the stream
-                -- relocates these to the end while the PDF keeps them at
-                -- page bottoms, and a consumer comparing the two needs to
-                -- know which paragraphs moved.
+                -- paragraph entry carries the footnote's ordinal too (a
+                -- schema field, Paragraph.footnote): the stream relocates
+                -- these to the end while the PDF keeps them at page
+                -- bottoms, so a consumer comparing the two needs to know
+                -- which paragraphs moved, and a viewer setting footnote k
+                -- beside its `footnote_ref` needs to know which paragraphs
+                -- are k.
                 for _, p in ipairs(paras) do
                     footnote_paras[p] = true
-                    all_paragraphs[p].footnote = true
+                    all_paragraphs[p].footnote = k
                 end
                 content = saved_content
                 cur_band.indent, cur_band.width = saved_band.indent, saved_band.width

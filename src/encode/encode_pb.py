@@ -30,8 +30,11 @@ OMIT_IF_ZERO = {'stretch_order', 'shrink_order', 'subtype', 'shift', 'glue_sign'
 NOT_ENCODED = {'file', 'gindex'}
 # lax: proto2 scopes enum value names to the package, so NodeType cannot also
 # name a value 'marker' (ItemKind claims it). The serializer's JSON keeps
-# type:"marker" for nodes; on the wire that is NodeType.mark.
-ENUM_ALIASES = {('latex.NodeType', 'marker'): 'mark'}
+# type:"marker" for nodes; on the wire that is NodeType.mark. The same for
+# a footnote reference: type:"footnote_ref" is NodeType.fnref, and the
+# ItemKind keeps the full name.
+ENUM_ALIASES = {('latex.NodeType', 'marker'): 'mark',
+                ('latex.NodeType', 'footnote_ref'): 'fnref'}
 
 
 def intern_glyph_metrics(doc: dict) -> None:
