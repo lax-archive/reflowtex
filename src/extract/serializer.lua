@@ -901,12 +901,32 @@ end
 -- \@makecaption sets a short caption as \hbox to\hsize{\hfil …\hfil},
 -- \centerline is \hbox to\hsize{\hss …\hss}, several classes build their
 -- title block from boxes, and the two-column page itself is an \hbox holding
--- the column vlists. Two shapes are told apart:
+-- the column vlists. Four shapes are told apart, in this order:
 --
 --   * a box holding vertical lists and no ink beside them — columns, or
 --     side-by-side \parbox/\vbox pairs — is walked column by column, each
 --     vlist in turn, so the stream keeps reading order (left column, then
 --     right);
+--   * a box holding, at any depth through further plain boxes, a line
+--     stamped with a paragraph (or an equation/alignment) is a *frame around
+--     content*, not content of its own — an output routine that re-wraps a
+--     line to decorate it. Its children are walked with the page walk's
+--     line and display semantics (the paragraph emitted once at its first
+--     line, displays as displays), and every other inky box inside the
+--     frame — a number, a margin mark — is dropped, never synthesized
+--     (holds_line / walk_frame);
+--   * a box whose ink lies wholly outside its own horizontal extent is a
+--     *margin decoration* and is dropped (ink_inside). lineno's
+--     \MakeLineNo does not wrap the line: it \unvbox'es it and appends,
+--     as a sibling in the vertical list, \hb@xt@\z@{\makeLineNumber} — a
+--     box of zero width and height whose number is \hss-ed into the left
+--     margin (or \hskip\columnwidth-ed into the right one, with [switch]
+--     alternating per page) — after a \kern of minus the line's depth. A
+--     \llap/\rlap in vertical mode has the same shape. Ink is located with
+--     TeX's own glue setting, so an \hfil-centred caption, a \centerline,
+--     and an overfull box keep their ink inside [0, width] and stay content;
+--     the box's own height and depth go to the pending glue, because TeX
+--     advanced by them (for lineno's box that cancels the kern exactly);
 --   * any other box with ink becomes a *synthesized paragraph*: its
 --     serialized children, closed by a \parfillskip, entered in
 --     all_paragraphs with the box as its band and its alignment read from
@@ -943,6 +963,66 @@ local function ink_beside_vlists(head)
         if t == "hlist" and ink_beside_vlists(c.head) then return true end
     end
     return false
+end
+
+-- Does this box frame a line? True when a paragraph-stamped line hlist, or
+-- an equation/alignment hlist, sits in it at any depth through plain boxes
+-- (vlists are not looked into: a box holding vlists is the column shape).
+local function holds_line(head)
+    for c in node.traverse(head) do
+        if node.type(c.id) == "hlist" then
+            if c.subtype == HL_LINE then
+                if find_para(c) then return true end
+            elseif c.subtype == HL_EQUATION or c.subtype == HL_ALIGNMENT then
+                return true
+            elseif holds_line(c.head) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- Where a box's ink is. Walks the box with each child's set position
+-- (node.rangedimensions applies the box's glue setting to the run before
+-- it; in a vlist a child hlist sits at its shift), and records in `st`
+-- whether any ink was met (`ink`) and whether any of it overlaps the open
+-- interval (0, w) of the outermost box's own width (`inside`). `x0` is the
+-- offset of this box within the outermost one.
+local function ink_inside(box, x0, w, st)
+    local vertical = node.type(box.id) == "vlist"
+    local function note(x, cw)
+        st.ink = true
+        if x + cw > 0 and x < w then st.inside = true end
+    end
+    for c in node.traverse(box.head) do
+        local t = node.type(c.id)
+        local x = x0
+        if vertical then
+            if t == "hlist" or t == "vlist" then x = x0 + (c.shift or 0) end
+        elseif c ~= box.head then
+            x = x0 + node.rangedimensions(box, box.head, c)
+        end
+        if t == "glyph" then
+            note(x, c.width or 0)
+        elseif t == "rule" then
+            if rule_has_area(c) then
+                local cw = c.width
+                if cw == RUNNING then x = x0; cw = box.width or 0 end
+                note(x, cw)
+            end
+        elseif t == "disc" then
+            if c.replace then note(x, (node.dimensions(c.replace)) or 0) end
+        elseif t == "hlist" or t == "vlist" then
+            ink_inside(c, x, w, st)
+        end
+        if st.inside then return st end
+    end
+    return st
+end
+local function margin_decoration(n)
+    local st = ink_inside(n, 0, n.width or 0, { ink = false, inside = false })
+    return st.ink and not st.inside
 end
 
 -- Alignment of a box from its own fill glue, the way \centering/\raggedright
@@ -1065,61 +1145,111 @@ local function walk_columns(cols, pending)
     pending.explicit = 0
 end
 
+-- A line box: emits its paragraph at its first line (a footnote line at a
+-- page bottom is already in the endnote stream).
+local function walk_line(n, pending)
+    local p = find_para(n)
+    if p and footnote_paras[p] then
+        -- A footnote line at the page bottom: already in the endnote
+        -- stream. The glue that came with the footnote block is not
+        -- body spacing, except what TeX put right under the rule,
+        -- which the endnote separator reproduces.
+        if endnote_sep and not endnote_sep.below then endnote_sep.below = pending.sp end
+        pending.sp = 0
+        pending.explicit = 0
+    else
+        if p then
+            local para = all_paragraphs[p]
+            cur_band.indent = para.indent
+            cur_band.width  = para.width
+            cur_leading = { baselineskip = para.baselineskip, lineskip = para.lineskip,
+                            lineskiplimit = para.lineskiplimit }
+        end
+        if p and not seen_para[p] and has_ink(all_paragraphs[p].nodes) then
+            emit_paragraph(p, pending)
+        elseif p and not seen_para[p] then
+            seen_para[p] = true
+            hoist_markers(all_paragraphs[p].nodes)
+        end
+        pending.sp = 0
+        pending.explicit = 0
+    end
+end
+
+local function walk_display(n, pending)
+    emit_display({
+        kind = "display",
+        -- \belowdisplayskip in force here, so a page break that discards it
+        -- (see emit_paragraph) can restore TeX's own value.
+        below_skip = param_dimen("belowdisplayskip"),
+        -- The band this display occupies, and where TeX put the box
+        -- inside it. display_shift is carried out here rather than on
+        -- the box because in a vertical list shift means a horizontal
+        -- displacement, whereas the renderer reaches the box through
+        -- its hlist path, where shift means a vertical offset —
+        -- passing it through would push displays down the page.
+        display_width  = cur_band.width > 0 and cur_band.width or n.width,
+        display_indent = cur_band.indent,
+        display_shift  = n.shift or 0,
+        box  = display_box(n, n.head and serialize_nodelist(n.head) or {}),
+    }, param_dimen("abovedisplayskip"), pending)
+end
+
+-- A plain box (see "Boxes in a vertical list"). `in_frame` is true for a
+-- box met inside a frame, where an inky box that is neither columns nor a
+-- frame itself is decoration and is dropped rather than synthesized. A
+-- dropped box's markers are hoisted so no marker vanishes with it.
+local walk_frame
+local function walk_box(n, pending, in_frame)
+    local cols = column_vlists(n.head, {})
+    if #cols > 0 and not ink_beside_vlists(n.head) then
+        walk_columns(cols, pending)
+    elseif holds_line(n.head) then
+        walk_frame(n.head, pending)
+    elseif in_frame or margin_decoration(n) then
+        hoist_markers(serialize_nodelist(n.head))
+        if not in_frame then
+            -- The box took this much of the vertical list; keep the
+            -- advance as pending glue (lineno's kern -depth + box of that
+            -- depth nets zero, as in the PDF).
+            pending.sp = (pending.sp or 0) + (n.height or 0) + (n.depth or 0)
+        end
+    else
+        synthesize_paragraph(n, pending)
+    end
+end
+
+-- The children of a frame: lines and displays as on a page, plain boxes
+-- through walk_box in frame mode, a vlist walked as a column. A frame is
+-- horizontal, so its glue and kerns are not vertical spacing and are
+-- ignored; bare glyphs and rules in it are decoration.
+walk_frame = function(head, pending)
+    for n in node.traverse(head) do
+        local t = node.type(n.id)
+        if t == "hlist" and n.subtype == HL_LINE then
+            walk_line(n, pending)
+        elseif t == "hlist" and (n.subtype == HL_EQUATION or n.subtype == HL_ALIGNMENT) then
+            walk_display(n, pending)
+        elseif t == "hlist" then
+            walk_box(n, pending, true)
+        elseif t == "vlist" then
+            walk_page(n.head, pending, n.width)
+        elseif t == "whatsit" and lax_marker(n) then
+            local side, num = lax_marker(n)
+            content[#content + 1] = { kind = "marker", side = side, n = num }
+        end
+    end
+end
+
 walk_page = function(head, pending, list_width)
     for n in node.traverse(head) do
         local t = node.type(n.id)
         if t == "hlist" and n.subtype == HL_LINE then
-            local p = find_para(n)
-            if p and footnote_paras[p] then
-                -- A footnote line at the page bottom: already in the endnote
-                -- stream. The glue that came with the footnote block is not
-                -- body spacing, except what TeX put right under the rule,
-                -- which the endnote separator reproduces.
-                if endnote_sep and not endnote_sep.below then endnote_sep.below = pending.sp end
-                pending.sp = 0
-                pending.explicit = 0
-            else
-                if p then
-                    local para = all_paragraphs[p]
-                    cur_band.indent = para.indent
-                    cur_band.width  = para.width
-                    cur_leading = { baselineskip = para.baselineskip, lineskip = para.lineskip,
-                                    lineskiplimit = para.lineskiplimit }
-                end
-                if p and not seen_para[p] and has_ink(all_paragraphs[p].nodes) then
-                    emit_paragraph(p, pending)
-                elseif p and not seen_para[p] then
-                    seen_para[p] = true
-                    hoist_markers(all_paragraphs[p].nodes)
-                end
-                pending.sp = 0
-                pending.explicit = 0
-            end
+            walk_line(n, pending)
         elseif t == "hlist" and (n.subtype == HL_EQUATION or n.subtype == HL_ALIGNMENT) then
-            emit_display({
-                kind = "display",
-                -- \belowdisplayskip in force here, so a page break that discards it
-                -- (see emit_paragraph) can restore TeX's own value.
-                below_skip = param_dimen("belowdisplayskip"),
-                -- The band this display occupies, and where TeX put the box
-                -- inside it. display_shift is carried out here rather than on
-                -- the box because in a vertical list shift means a horizontal
-                -- displacement, whereas the renderer reaches the box through
-                -- its hlist path, where shift means a vertical offset —
-                -- passing it through would push displays down the page.
-                display_width  = cur_band.width > 0 and cur_band.width or n.width,
-                display_indent = cur_band.indent,
-                display_shift  = n.shift or 0,
-                box  = display_box(n, n.head and serialize_nodelist(n.head) or {}),
-            }, param_dimen("abovedisplayskip"), pending)
+            walk_display(n, pending)
         elseif t == "hlist" then
-            -- A plain box in the vertical list (see "Boxes in a vertical list").
-            local cols = column_vlists(n.head, {})
-            if #cols > 0 and not ink_beside_vlists(n.head) then
-                walk_columns(cols, pending)
-            else
-                synthesize_paragraph(n, pending)
-            end
+            walk_box(n, pending, false)
         elseif t == "vlist" then
             walk_page(n.head, pending, n.width)
         elseif t == "rule" then
