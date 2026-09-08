@@ -263,6 +263,12 @@ local CITETGT_ATTR = 904  -- glyphs of a bibliography label [n]
 local BODY_ATTR   = 905
 local RULE_IMAGE  = 2
 local picture_files = {}
+-- lax: the page of a multi-page file a picture shows (\includegraphics
+-- [page=N]{figures.pdf} — one PDF holding every figure of a paper, addressed
+-- by page), recorded beside the file by laxreflow.sty's \Gin@setfile hook;
+-- the template's tikz capture passes none, and an unpaged picture carries no
+-- page field.
+local picture_pages = {}
 
 -- lax: \laxmark (laxreflow.sty, the archive's injection package) lowers each
 -- lax marker to a user_defined whatsit with this user_id and a string value
@@ -277,8 +283,16 @@ local function lax_marker(n)
 end
 
 Serializer = Serializer or {}
-function Serializer.note_picture(id, file)
+function Serializer.note_picture(id, file, page)
     picture_files[id] = file
+    -- lax: a positive integer or nothing; the caller's value is TeX's
+    -- \number of the key, but only a number joins the node.
+    local n = tonumber(page)
+    if n and n >= 1 and n == math.floor(n) then
+        picture_pages[id] = math.floor(n)
+    else
+        picture_pages[id] = nil
+    end
 end
 function Serializer.mark_body(boxnum)
     local b = tex.box[boxnum]
@@ -427,7 +441,8 @@ local function serialize_nodelist(head)
         elseif t == "rule" and n.subtype == RULE_IMAGE then
             -- An externalised picture. Keep TeX's metrics — they are what lets
             -- the picture behave as an ordinary box everywhere — and carry the
-            -- source file across for prebuild.py to turn into SVG.
+            -- source file across for prebuild.py to turn into SVG (lax: with
+            -- the page of it, when the include named one).
             local id = node.get_attribute(n, PIC_ATTR)
             cur[#cur + 1] = {
                 type   = "picture",
@@ -435,6 +450,7 @@ local function serialize_nodelist(head)
                 height = n.height,
                 depth  = n.depth,
                 file   = id and picture_files[id] or nil,
+                page   = id and picture_pages[id] or nil,
             }
 
         elseif t == "rule" then
