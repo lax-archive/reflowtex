@@ -155,10 +155,11 @@ def normalise_glyph_addressing(data: dict, fonts) -> int:
 
 
 def normalise_legacy_font_addressing(data: dict, fonts) -> int:
-    """Convert 'unknown' Type1 fonts to OTFs and rewrite their glyphs to PUA codes.
+    """Convert 'unknown' Type1 fonts to OTFs and re-address their glyph nodes.
 
     `fonts` is a fonts.Fonts instance; it does the (cached) conversion and owns the
-    written files. Returns the number of glyph nodes rewritten.
+    written files. Returns the number of glyph nodes rewritten. A glyph node the
+    converted font has no slot for is dropped, not left behind — see DROP_NOTE.
     """
     rewrite: dict[str, dict[int, int]] = {}    # font id → {slot → target codepoint}
     for fid, info in fonts_of(data).items():
@@ -173,35 +174,62 @@ def normalise_legacy_font_addressing(data: dict, fonts) -> int:
     if not rewrite:
         return 0
 
-    rewritten = 0
+    rewritten = dropped = 0
 
-    def walk(nodes):
-        nonlocal rewritten
+    # DROP_NOTE: a glyph node of a converted legacy font whose `char` is not one
+    # of that font's slots is dropped. Such a node is LuaTeX's record of a
+    # character the 8-bit font could not set — "Missing character: There is no ’
+    # (U+2019) in font ec-lmr9", from a literal ’ in a T1-encoded document — and
+    # it carries zero width, height and depth because nothing was typeset. Its
+    # `char` is the *input* codepoint, which is meaningless in the converted
+    # font's address space: the OTF's cmap is keyed by target codepoint, and
+    # every slot with a standard Unicode meaning claims exactly that codepoint,
+    # so a missing ’ lands squarely on the slot-0x27 quoteright the font does
+    # carry. The browser then draws a quote the PDF has no ink for, with the
+    # node's zero advance, stacking it on the next character like a diacritic
+    # ("al.’s" as "al.ŝ"). Leaving the node was only ever safe while no slot of
+    # the font held a real codepoint; it never was. The same reasoning covers a
+    # `char` in 0..255 whose slot names no glyph the .pfb has — TeX set nothing
+    # there either, and the codepoint could equally collide with another slot's
+    # target. Dropping is what the PDF shows and costs no geometry: the node is
+    # empty in all three dimensions.
+    def walk(nodes: list) -> list:
+        nonlocal rewritten, dropped
+        kept = []
         for n in nodes:
             if n.get('type') == 'glyph':
                 addressing = rewrite.get(str(n.get('font')))
                 if addressing is not None:
                     ch = n.get('char')
-                    # Rewrite only slots the OTF actually addresses (0..255); an
-                    # unencoded one is left as-is (it renders as nothing rather than
-                    # a wrong glyph). The pass never runs twice on a font — once its
-                    # filename is set above it is skipped — so no anti-re-entry guard
-                    # on the codepoint is needed, which is good because a slot can now
-                    # map to a real codepoint below 256.
-                    if ch is not None and ch in addressing:
-                        n['char'] = addressing[ch]
-                        rewritten += 1
+                    if ch is None or ch not in addressing:
+                        dropped += 1
+                        continue
+                    # The pass never runs twice on a font — once its filename is
+                    # set above it is skipped — so no anti-re-entry guard on the
+                    # codepoint is needed, which is good because a slot can map to
+                    # a real codepoint below 256.
+                    n['char'] = addressing[ch]
+                    rewritten += 1
             for k in ('children', 'replace', 'pre', 'post', 'nobreak'):
                 if k in n:
-                    walk(n[k])
-            if 'leader' in n:
-                walk([n['leader']])
+                    n[k] = walk(n[k])
+            if 'leader' in n:                     # a single node (see LEADER_NOTE)
+                kept_leader = walk([n['leader']])
+                if kept_leader:
+                    n['leader'] = kept_leader[0]
+                else:
+                    del n['leader']
+            kept.append(n)
+        return kept
 
     for para in data.get('paragraphs', []):
-        walk(para.get('nodes', []))
+        para['nodes'] = walk(para.get('nodes', []))
     for item in data.get('content', []):
         if 'box' in item:
-            walk(item['box'].get('children', []))
+            item['box']['children'] = walk(item['box'].get('children', []))
+    if dropped:
+        print(f'  t1-convert: dropped {dropped} glyph node(s) the legacy font '
+              f'could not set (LuaTeX missing characters)')
     return rewritten
 
 
