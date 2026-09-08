@@ -1314,8 +1314,16 @@ local function note_inserts(extrainfo)
                 content = footnote_content
                 walk_page(n.head, footnote_pending, all_paragraphs[paras[1]].width)
                 -- Marked only now: the walk above must see these lines as
-                -- ordinary paragraphs; the page walk later must not.
-                for _, p in ipairs(paras) do footnote_paras[p] = true end
+                -- ordinary paragraphs; the page walk later must not. The
+                -- paragraph entry carries the mark too (bookkeeping only,
+                -- like `synthesized`; not a schema field): the stream
+                -- relocates these to the end while the PDF keeps them at
+                -- page bottoms, and a consumer comparing the two needs to
+                -- know which paragraphs moved.
+                for _, p in ipairs(paras) do
+                    footnote_paras[p] = true
+                    all_paragraphs[p].footnote = true
+                end
                 content = saved_content
                 cur_band.indent, cur_band.width = saved_band.indent, saved_band.width
                 cur_leading = saved_leading
