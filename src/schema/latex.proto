@@ -44,6 +44,9 @@ enum NodeType {
   // vertical-mode form), so the wire name here is `fnref`; the serializer's
   // JSON says type:"footnote_ref" for both and encode_pb maps it.
   fnref     = 12;
+  // lax: hyperlinks. See Node.target.
+  link      = 13;
+  dest      = 14;
 }
 
 message Node {
@@ -98,6 +101,12 @@ message Node {
   // fnref (lax) reuses `n` for the footnote ordinal.
   optional string   side          = 33;
   optional uint32   n             = 34;
+
+  // link (lax): the start ("b") or end ("e") of a hyperlink's text; on the
+  // start, `target` is "#<destination>" for an internal link and the URL
+  // otherwise. dest (lax): a hyperref destination, named by `target`. Both are
+  // zero-size and invisible, like a marker.
+  optional string   target        = 35;
 }
 
 // One distinct glyph box (width/height/depth in sp), referenced by Node.metrics.
@@ -157,6 +166,9 @@ enum ItemKind {
   // \footnotetext between paragraphs): emitted at the walk position, as a
   // marker is. `n` is the footnote's ordinal.
   footnote_ref = 4;
+  // lax: a hyperref destination in vertical mode (a section's, a theorem's),
+  // named by `target`. `dest` is NodeType's, under the same scoping rule.
+  dest_item = 5;
 }
 
 message ContentItem {
@@ -176,6 +188,7 @@ message ContentItem {
   // footnote_ref (lax) reuses `n` for the footnote ordinal.
   optional string side = 8;
   optional uint32 n    = 9;
+  optional string target = 10;
 }
 
 message Document {

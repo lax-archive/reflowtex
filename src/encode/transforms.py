@@ -36,9 +36,10 @@ from fonts import fonts_of
 # must receive — stripping it here would silently unmoor every passage card.
 # 'footnote_ref' (lax) likewise: the reference point a viewer sets footnote
 # k beside; strip it and every footnote falls back to an endnote.
+# 'link' and 'dest' (lax): hyperref's links and their destinations.
 SUPPORTED_NODE_TYPES = {'glyph', 'glue', 'kern', 'rule', 'hlist', 'vlist',
                         'disc', 'penalty', 'math', 'picture', 'transform',
-                        'marker', 'footnote_ref'}
+                        'marker', 'footnote_ref', 'link', 'dest'}
 
 # LEADER_NOTE: leader glue (\cleaders and friends) hangs a single box off the
 # glue node, which TeX tiles across the glue's set width. It is a node like any

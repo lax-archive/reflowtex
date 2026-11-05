@@ -47,6 +47,7 @@ fontTools is required (t1Lib for parsing, fontBuilder for emitting). Without it,
 convert() is unavailable and the caller keeps the metric-box fallback.
 """
 import hashlib
+import json
 import os
 import subprocess
 import unicodedata
@@ -54,8 +55,10 @@ from pathlib import Path
 
 try:
     from fontTools import t1Lib, agl
+    from fontTools.encodings.StandardEncoding import StandardEncoding
     from fontTools.fontBuilder import FontBuilder
     from fontTools.pens.t2CharStringPen import T2CharStringPen
+    from fontTools.pens.transformPen import TransformPen
     _AVAILABLE = True
 except ImportError:                                        # pragma: no cover
     _AVAILABLE = False
@@ -722,15 +725,81 @@ def convert(name: str, out_dir: Path) -> tuple[str, dict[int, int]] | None:
     """
     if not _AVAILABLE:
         return None
-    found = find_outline(name)
-    if not found:
-        return None
-    pfb, enc = found
     try:
+        composition = find_composition(name)
+        if composition:
+            return _compose(composition, name, Path(out_dir))
+        found = find_outline(name)
+        if not found:
+            return None
+        pfb, enc = found
         return _convert(pfb, name, Path(out_dir), parse_enc(enc) if enc else None)
     except Exception as e:                                  # noqa: BLE001
         print(f'  t1-convert: {name} skipped ({type(e).__name__}: {e}) — keeps metric boxes')
         return None
+
+
+def find_composition(name: str) -> Path | None:
+    """(lax) The composition the lax exporter wrote for a virtual font, when
+    there is one. See _compose."""
+    local = os.environ.get('REFLOWTEX_PFB_DIR')
+    if not local:
+        return None
+    path = Path(local) / f'{name}.compose.json'
+    return path if path.is_file() else None
+
+
+def _source(name: str, directory: Path):
+    """(lax) One real font a virtual font draws from: its glyphs, its
+    code -> glyph name vector, its scale to 1000 units per em."""
+    t1 = t1Lib.T1Font(str(directory / f'{name}.pfb'), encoding='latin-1')
+    t1.parse()
+    enc = directory / f'{name}.enc'
+    encoding = parse_enc(str(enc)) if enc.is_file() else t1.font['Encoding']
+    if encoding == 'StandardEncoding':
+        encoding = StandardEncoding
+    return t1.getGlyphSet(), encoding, 1000 * t1.font['FontMatrix'][0]
+
+
+def _compose(composition: Path, name: str, out_dir: Path) -> tuple[str, dict[int, int]]:
+    """(lax) Build one OTF for a virtual font from the real fonts it maps in.
+
+    A virtual font is a program per slot, and mathpazo's zplmr7m shows why no
+    single outline can stand in for one: its alpha is `a` in PazoMath-Italic,
+    its Latin comes from Palatino, its remaining Greek from cmmi10 scaled to
+    1.042. The exporter has read the program into `{"sources": [{"name",
+    "at"}], "slots": {"<slot>": [source index, code, dx, dy]}}`, offsets in
+    design-size units, and each slot is drawn from its own source. A slot
+    whose code names no glyph is left out and keeps its metric box.
+    """
+    spec = json.loads(composition.read_text(encoding='utf-8'))
+    directory = composition.parent
+    sources = [_source(source['name'], directory) for source in spec['sources']]
+    upm = 1000
+    named: dict[int, str] = {}
+    charstrings, metrics = {}, {}
+    pen = T2CharStringPen(0, None)
+    charstrings['.notdef'], metrics['.notdef'] = pen.getCharString(), (0, 0)
+    for key, (index, code, dx, dy) in spec['slots'].items():
+        slot = int(key)
+        glyphs, encoding, unit = sources[index]
+        gname = encoding[code]
+        if gname == '.notdef' or gname not in glyphs:
+            continue
+        scale = unit * spec['sources'][index]['at']
+        pen = T2CharStringPen(0, None)
+        glyph = glyphs[gname]
+        glyph.draw(TransformPen(pen, (scale, 0, 0, scale, dx * upm, dy * upm)))
+        internal = f'slot{slot}'
+        named[slot] = gname
+        charstrings[internal] = pen.getCharString()
+        metrics[internal] = (round((getattr(glyph, 'width', 0) or 0) * scale), 0)
+    if not named:
+        raise ValueError('no slot resolved to a glyph')
+    addressing = _addressing(named)
+    order = ['.notdef'] + [f'slot{slot}' for slot in sorted(named)]
+    cmap = {addressing[slot]: f'slot{slot}' for slot in named}
+    return _emit(name, out_dir, upm, order, cmap, charstrings, metrics), addressing
 
 
 def _convert(pfb: str, name: str, out_dir: Path,
@@ -763,11 +832,18 @@ def _convert(pfb: str, name: str, out_dir: Path,
         charstrings[gname] = pen.getCharString()
         metrics[gname] = (advance, 0)          # (advance, lsb); lsb unused here
 
+    return _emit(name, out_dir, upm, order, {addressing[s]: gname for s, gname in slots.items()},
+                 charstrings, metrics), addressing
+
+
+def _emit(name: str, out_dir: Path, upm: int, order: list[str], cmap: dict[int, str],
+          charstrings: dict, metrics: dict) -> str:
+    """Write the OTF under a content-hashed name, and return that name."""
     ps = f'{name}-ReflowTeXConverted'          # PostScript name: no spaces
     label = f'{name} (ReflowTeX converted)'
     fb = FontBuilder(upm, isTTF=False)
     fb.setupGlyphOrder(order)
-    fb.setupCharacterMap({addressing[s]: gname for s, gname in slots.items()})
+    fb.setupCharacterMap(cmap)
     fb.setupCFF(ps, {'FullName': label}, charstrings, {})
     fb.setupHorizontalMetrics(metrics)
     # The viewer positions every glyph explicitly from the node's own metrics, so
@@ -787,4 +863,4 @@ def _convert(pfb: str, name: str, out_dir: Path,
     digest = hashlib.sha256(tmp.read_bytes()).hexdigest()[:8]
     served = f'{name}.reflowtex-{digest}.otf'
     tmp.replace(out_dir / served)
-    return served, addressing
+    return served

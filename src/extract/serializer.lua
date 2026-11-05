@@ -332,6 +332,34 @@ for subtype, name in pairs(node.whatsits()) do WH[name] = subtype end
 local WH_SETMATRIX = assert(WH.pdf_setmatrix, "no pdf_setmatrix whatsit subtype")
 local WH_SAVE      = assert(WH.pdf_save,      "no pdf_save whatsit subtype")
 local WH_RESTORE   = assert(WH.pdf_restore,   "no pdf_restore whatsit subtype")
+local WH_DEST       = assert(WH.pdf_dest,       "no pdf_dest whatsit subtype")
+local WH_START_LINK = assert(WH.pdf_start_link, "no pdf_start_link whatsit subtype")
+local WH_END_LINK   = assert(WH.pdf_end_link,   "no pdf_end_link whatsit subtype")
+
+-- lax: hyperref's links. A destination is a whatsit carrying its name, and a
+-- link is a start/end pair around its text, so both reach the node list as
+-- zero-size positions the viewer can anchor and outline. An internal link's
+-- action names its destination; hyperref writes a URL as a raw action
+-- (`user`, the PDF dictionary as text), so the URL is read out of that, with
+-- the PDF string escapes undone. Anything else (a file link, a named action)
+-- has no target here, and its text stays plain text.
+local ACTION_GOTO, ACTION_USER = 1, 3
+local function link_target(n)
+    local action = n.action
+    if not action then return nil end
+    if action.action_type == ACTION_GOTO and action.named_id == 1 then
+        return "#" .. tostring(action.action_id)
+    end
+    if action.action_type == ACTION_USER and action.data then
+        local uri = tostring(action.data):match("/URI%((.*)%)")
+        if uri then return (uri:gsub("\\(.)", "%1")) end
+    end
+    return nil
+end
+local function lax_dest(n)
+    if n.subtype == WH_DEST and n.named_id == 1 then return tostring(n.dest_id) end
+    return nil
+end
 
 local function parse_matrix(data)
     if not data then return nil end
@@ -436,6 +464,16 @@ local function serialize_nodelist(head)
             -- exact position in the captured node list.
             local side, num = lax_marker(n)
             cur[#cur + 1] = { type = "marker", side = side, n = num }
+
+        elseif t == "whatsit" and lax_dest(n) then
+            cur[#cur + 1] = { type = "dest", target = lax_dest(n) }
+
+        elseif t == "whatsit" and n.subtype == WH_START_LINK then
+            local target = link_target(n)
+            if target then cur[#cur + 1] = { type = "link", side = "b", target = target } end
+
+        elseif t == "whatsit" and n.subtype == WH_END_LINK then
+            cur[#cur + 1] = { type = "link", side = "e" }
 
         elseif t == "whatsit" and n.stack ~= nil and n.command ~= nil then
             -- pdf_colorstack whatsit: update colour state; nothing to emit
@@ -635,12 +673,21 @@ end
 -- distance to the *left* of the text — lands at negative x and is clipped.
 -- The band this paragraph occupies: {indent, width}. Doubles as the band any
 -- display inside it inherits (see the \displaywidth note below).
+--
+-- lax: a finite \leftskip indents the same way. It is furniture the line
+-- breaker adds, so it never reaches the captured list either, while what a
+-- paragraph does to undo it does: LaTeX's table of contents sets \leftskip to
+-- the number's width and opens with \hskip -\leftskip, hanging the number left
+-- of the text, so without the indent every section number lands at negative x.
+-- \centering's fill has no width and changes nothing.
 local function para_band()
-    local ok, ps = pcall(function() return tex.parshape end)
-    if ok and type(ps) == "table" and ps[1] and ps[1][1] and ps[1][2] then
-        return ps[1][1], ps[1][2]
+    local ok, left = pcall(tex.getglue, "leftskip")
+    left = ok and left or 0
+    local has, ps = pcall(function() return tex.parshape end)
+    if has and type(ps) == "table" and ps[1] and ps[1][1] and ps[1][2] then
+        return ps[1][1] + left, ps[1][2] - left
     end
-    return 0, tex.hsize or 0
+    return left, (tex.hsize or 0) - left
 end
 
 -- TeX's interline spacing parameters, active when this paragraph is broken. The
@@ -824,6 +871,8 @@ local function hoist_markers(nodes)
             content[#content + 1] = { kind = "marker", side = it.side, n = it.n }
         elseif it.type == "footnote_ref" then
             content[#content + 1] = { kind = "footnote_ref", n = it.n }
+        elseif it.type == "dest" then
+            content[#content + 1] = { kind = "dest_item", target = it.target }
         end
         if it.children then hoist_markers(it.children) end
         if it.replace then hoist_markers(it.replace) end
@@ -1342,6 +1391,8 @@ walk_frame = function(head, pending)
         elseif t == "whatsit" and lax_marker(n) then
             local side, num = lax_marker(n)
             content[#content + 1] = { kind = "marker", side = side, n = num }
+        elseif t == "whatsit" and lax_dest(n) then
+            content[#content + 1] = { kind = "dest_item", target = lax_dest(n) }
         end
     end
 end
@@ -1388,6 +1439,11 @@ walk_page = function(head, pending, list_width)
             -- the marker is unchanged.
             local side, num = lax_marker(n)
             content[#content + 1] = { kind = "marker", side = side, n = num }
+        elseif t == "whatsit" and lax_dest(n) then
+            -- lax: most of hyperref's destinations sit here: a section's and
+            -- a theorem's anchor are set in vertical mode. In place, as a
+            -- marker is, `pending` untouched.
+            content[#content + 1] = { kind = "dest_item", target = lax_dest(n) }
         elseif t == "whatsit" and n.user_id == LAX_FOOTNOTE_REF_ID then
             -- lax: a vertical-mode footnote's reference point, left here by
             -- note_inserts in place of the insert the page builder removed.

@@ -45,6 +45,19 @@ uses it to build the reflow view shown beside each submitted paper's PDF.
   (user_id 90212) below that glue; the walk restores it when the heading
   — or the paragraph a run-in `\paragraph` opens — is first on a page,
   the same rule as the `\belowdisplayskip` restore.
+- **Hyperlinks** (`src/extract/serializer.lua`, `src/schema/latex.proto`,
+  `src/encode/transforms.py`): hyperref's link and destination whatsits
+  reach the stream as zero-size `link` and `dest` nodes, and as `dest_item`
+  items between flow items, so the viewer can outline a link's ink and
+  anchor its target. A URL is read out of the raw action hyperref writes.
+- **Composed virtual fonts** (`src/encode/t1_convert.py`): a font with a
+  `<name>.compose.json` beside its sources in `REFLOWTEX_PFB_DIR` is built
+  slot by slot from the real fonts its program draws from, each at its own
+  scale and offset. mathpazo's math italic has to be: its Greek is drawn from
+  PazoMath-Italic at the codes of Latin letters.
+- **Finite `\leftskip`** (`src/extract/serializer.lua`): recorded in the
+  paragraph band. A table of contents hangs its numbers left of a `\leftskip`
+  with `\hskip -\leftskip`, which landed them at negative x without it.
 - **Encode hardening** (`src/encode/encode_pb.py`): prefer a regenerated
   `latex_pb2.py`, fail loudly on unknown enum values, and serialize
   deterministically through `serialize_document()`.
